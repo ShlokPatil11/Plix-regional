@@ -1,0 +1,275 @@
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
+import logging
+import mimetypes
+import os
+from pathlib import Path
+import sys
+import tempfile
+import threading
+import traceback
+from uuid import uuid4
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse
+
+from .contracts import PipelineStageError
+from .in_process import run_operation
+from .job_store import JobStore
+from .media import FileArtifactBackend
+from .service_adapters import LANGUAGES
+
+
+DATA_DIR = Path(os.getenv("PIPELINE_DATA_DIR", str(Path(tempfile.gettempdir()) / "dir-language-pipeline"))).resolve()
+MAX_UPLOAD_BYTES = int(os.getenv("PIPELINE_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
+JOB_ROOT = DATA_DIR / "jobs"
+JOB_ROOT.mkdir(parents=True, exist_ok=True)
+store = JobStore(DATA_DIR / "jobs.sqlite3")
+stop_worker = threading.Event()
+worker_thread: threading.Thread | None = None
+
+
+class _TerminalAndFileStream:
+    """Mirror every worker print to the server terminal and a persistent log."""
+
+    def __init__(self, terminal, logfile, job_id: str):
+        self.terminal = terminal
+        self.logfile = logfile
+        self.prefix = f"[job {job_id}] "
+        self.line_start = True
+        self.lock = threading.RLock()
+
+    def write(self, value: str) -> int:
+        if not value:
+            return 0
+        with self.lock:
+            offset = 0
+            while offset < len(value):
+                end = value.find("\n", offset)
+                end = len(value) if end < 0 else end + 1
+                piece = value[offset:end]
+                if self.line_start:
+                    self.terminal.write(self.prefix)
+                    self.logfile.write(self.prefix)
+                self.terminal.write(piece)
+                self.logfile.write(piece)
+                self.line_start = piece.endswith("\n")
+                offset = end
+            self.flush()
+        return len(value)
+
+    def flush(self) -> None:
+        self.terminal.flush()
+        self.logfile.flush()
+
+    def isatty(self) -> bool:
+        return bool(getattr(self.terminal, "isatty", lambda: False)())
+
+
+def _process_job(job: dict) -> None:
+    job_id = job["job_id"]
+    job_root = JOB_ROOT / job_id
+    artifacts_root = job_root / "artifacts"
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+    backend = FileArtifactBackend(artifacts_root)
+    log_path = job_root / "process.log"
+    try:
+        with log_path.open("a", encoding="utf-8", buffering=1) as log:
+            terminal = sys.__stdout__ or sys.stdout
+            stream = _TerminalAndFileStream(terminal, log, job_id)
+            root_logger = logging.getLogger()
+            previous_level = root_logger.level
+            handler = logging.StreamHandler(stream)
+            root_logger.addHandler(handler)
+            if previous_level > logging.INFO:
+                root_logger.setLevel(logging.INFO)
+            try:
+                with redirect_stdout(stream), redirect_stderr(stream):
+                    print(f"Starting pipeline for {job['input_name']} | source={job['source_language']} | target={job['target_language']}")
+                    source = Path(job["input_path"])
+                    content_type = mimetypes.guess_type(job["input_name"])[0] or "application/octet-stream"
+                    incoming = backend.upload(source, filename=job["input_name"], content_type=content_type)
+                    result = run_operation(
+                        incoming,
+                        operation=job["operation"],
+                        target_language=job["target_language"],
+                        source_language=job["source_language"],
+                        backend=backend,
+                        job_id=job_id,
+                        on_stage=lambda value: (store.stage(job_id, value), print(f"--- stage: {value} ---", flush=True)),
+                    )
+            finally:
+                root_logger.removeHandler(handler)
+                root_logger.setLevel(previous_level)
+        output_artifacts = {
+            name: artifact.metadata["path"] for name, artifact in result.items()
+        }
+        store.finish(job_id, output_artifacts)
+    except Exception as exc:
+        stage = exc.stage if isinstance(exc, PipelineStageError) else "processing"
+        trace = traceback.format_exc()
+        with log_path.open("a", encoding="utf-8", buffering=1) as log:
+            log.write(f"\n[job {job_id}] FAILED at {stage}: {exc}\n{trace}\n")
+        error_console = sys.__stderr__ or sys.stderr
+        print(f"[job {job_id}] FAILED at {stage}: {exc}\n{trace}", file=error_console, flush=True)
+        store.fail(job_id, stage, str(exc))
+
+
+def _worker() -> None:
+    terminal = sys.__stderr__ or sys.stderr
+    print("[pipeline-worker] started", file=terminal, flush=True)
+    while not stop_worker.is_set():
+        job = None
+        try:
+            job = store.claim()
+            if job is None:
+                stop_worker.wait(0.5)
+                continue
+            print(f"[pipeline-worker] claimed job {job['job_id']}", file=terminal, flush=True)
+            _process_job(job)
+        except Exception:
+            details = traceback.format_exc()
+            print(f"[pipeline-worker] loop error\n{details}", file=terminal, flush=True)
+            if job is not None:
+                try:
+                    store.fail(job["job_id"], "worker", details.strip())
+                except Exception:
+                    print(f"[pipeline-worker] could not record failure for {job['job_id']}\n{traceback.format_exc()}", file=terminal, flush=True)
+            stop_worker.wait(2)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global worker_thread
+    stop_worker.clear()
+    worker_thread = threading.Thread(target=_worker, name="directory-language-worker", daemon=True)
+    worker_thread.start()
+    try:
+        yield
+    finally:
+        stop_worker.set()
+        if worker_thread:
+            await asyncio.to_thread(worker_thread.join, 30)
+
+
+app = FastAPI(title="Directory Language Studio", version="1.0.0", lifespan=lifespan)
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return HTMLResponse((Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8"))
+
+
+@app.get("/api/languages")
+def languages():
+    return [{"code": code, "name": name} for code, name in LANGUAGES.items()]
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "worker_running": bool(worker_thread and worker_thread.is_alive()),
+    }
+
+
+@app.post("/api/jobs", status_code=202)
+async def submit_job(
+    file: UploadFile = File(...),
+    target_language: str = Form(...),
+    source_language: str | None = Form(None),
+    operation: str = Form("combine"),
+):
+    if operation not in {"masking", "dubbing", "combine"}:
+        raise HTTPException(422, "Operation must be masking, dubbing, or combine.")
+    target = target_language.lower().strip()
+    if target not in LANGUAGES:
+        raise HTTPException(422, f"Unsupported target language code: {target}")
+    suffix = Path(file.filename or "video.mp4").suffix.lower()
+    if suffix not in {".mp4", ".mov", ".mkv", ".avi", ".webm"}:
+        raise HTTPException(415, "Upload an MP4, MOV, MKV, AVI, or WebM video.")
+
+    job_id = uuid4().hex
+    job_root = JOB_ROOT / job_id
+    input_dir = job_root / "input"
+    input_dir.mkdir(parents=True, exist_ok=False)
+    safe_name = Path(file.filename or f"video{suffix}").name
+    destination = input_dir / safe_name
+    written = 0
+    try:
+        with destination.open("wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, "Video exceeds configured upload size limit.")
+                output.write(chunk)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+
+    source = (source_language or os.getenv("PIPELINE_SOURCE_LANGUAGE", "auto")).strip() or "auto"
+    store.create(job_id, target, source, destination, safe_name, operation)
+    return {"job_id": job_id, "status": "queued", "operation": operation, "status_url": f"/api/jobs/{job_id}"}
+
+
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str):
+    record = store.get(job_id)
+    if record is None:
+        raise HTTPException(404, "Job not found")
+    return {
+        "job_id": job_id,
+        "status": record["status"],
+        "stage": record["stage"],
+        "target_language": record["target_language"],
+        "source_language": record["source_language"],
+        "operation": record["operation"],
+        "error": record["error"],
+        "artifacts": {
+            name: f"/api/jobs/{job_id}/artifacts/{name}"
+            for name in record["artifacts"]
+        },
+        "manifest_url": f"/api/jobs/{job_id}/manifest",
+        "log_url": f"/api/jobs/{job_id}/logs",
+        "created_at": record["created_at"],
+        "updated_at": record["updated_at"],
+    }
+
+
+@app.get("/api/jobs/{job_id}/logs")
+def get_job_log(job_id: str):
+    if store.get(job_id) is None:
+        raise HTTPException(404, "Job not found")
+    path = JOB_ROOT / job_id / "process.log"
+    if not path.is_file():
+        raise HTTPException(404, "Job log not available yet")
+    return FileResponse(path, media_type="text/plain; charset=utf-8", filename="process.log")
+
+
+@app.get("/api/jobs/{job_id}/manifest")
+def get_manifest(job_id: str):
+    if store.get(job_id) is None:
+        raise HTTPException(404, "Job not found")
+    path = JOB_ROOT / job_id / "manifest.json"
+    if not path.is_file():
+        raise HTTPException(404, "Manifest not available")
+    return FileResponse(path, media_type="application/json", filename="manifest.json")
+
+
+@app.get("/api/jobs/{job_id}/artifacts/{name}")
+def get_artifact(job_id: str, name: str):
+    record = store.get(job_id)
+    if record is None:
+        raise HTTPException(404, "Job not found")
+    if name not in record["artifacts"]:
+        raise HTTPException(404, "Artifact not available")
+    path = Path(record["artifacts"][name]).resolve()
+    allowed = (JOB_ROOT / job_id / "artifacts").resolve()
+    if allowed not in path.parents or not path.is_file():
+        raise HTTPException(404, "Artifact not available")
+    media = "video/mp4" if path.suffix.lower() == ".mp4" else "application/x-subrip" if path.suffix.lower() == ".srt" else "application/octet-stream"
+    return FileResponse(path, media_type=media, filename=path.name)

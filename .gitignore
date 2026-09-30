@@ -1,0 +1,9 @@
+output/
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+jobs/
+*.sqlite3
+*.db

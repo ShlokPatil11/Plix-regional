@@ -1,0 +1,26 @@
+services:
+  app:
+    build: .
+    image: directory-language-studio
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: "8000"
+      PIPELINE_DATA_DIR: /data
+      PIPELINE_MAX_UPLOAD_BYTES: ${PIPELINE_MAX_UPLOAD_BYTES:-2147483648}
+      PIPELINE_SOURCE_LANGUAGE: ${PIPELINE_SOURCE_LANGUAGE:-auto}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      TRANSLATION_MODEL: ${TRANSLATION_MODEL:-}
+      TRANSLATION_PROVIDER: ${TRANSLATION_PROVIDER:-gemini}
+      OCR_PROVIDER: ${OCR_PROVIDER:-gemini}
+      OCR_TARGET_BOX: ${OCR_TARGET_BOX:-agent}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      SYNC_API_KEY: ${SYNC_API_KEY:-}
+      SYNC_MODEL: ${SYNC_MODEL:-lipsync-2-pro}
+    volumes:
+      - directory-language-data:/data
+
+volumes:
+  directory-language-data:
