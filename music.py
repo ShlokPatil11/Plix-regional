@@ -218,6 +218,41 @@ def _run_ffmpeg(command: list[str]) -> None:
         raise MusicFetchError(f"ffmpeg failed: {completed.stderr.strip()}")
 
 
+MIN_ALIGNED_SECONDS = 0.5
+
+
+def _ffprobe_binary(ffmpeg_binary: str) -> str:
+    """ffprobe lives next to ffmpeg (same convention as Service B)."""
+    path = Path(ffmpeg_binary)
+    name = path.name.replace("ffmpeg", "ffprobe").replace("FFMPEG", "FFPROBE")
+    return name if str(path.parent) == "." else str(path.parent / name)
+
+
+def _audio_duration(ffmpeg_binary: str, path: Path) -> float:
+    """Decoded duration in seconds; 0.0 when the file is missing or unreadable."""
+    if not path.is_file():
+        return 0.0
+    try:
+        completed = subprocess.run(
+            [_ffprobe_binary(ffmpeg_binary), "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True,
+        )
+        return float(completed.stdout.strip()) if completed.returncode == 0 else 0.0
+    except (OSError, ValueError):
+        pass
+    # No ffprobe: decode with ffmpeg and read the last progress time.
+    completed = subprocess.run(
+        [ffmpeg_binary, "-hide_banner", "-nostdin", "-i", str(path), "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    times = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", completed.stderr)
+    if completed.returncode or not times:
+        return 0.0
+    hours, minutes, seconds = times[-1]
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
 def _cut_window(ffmpeg_binary: str, source: Path, start: float, end: float, output: Path) -> None:
     _run_ffmpeg([
         ffmpeg_binary, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
@@ -263,6 +298,9 @@ def _identify_and_fetch(source_video, words, duration_s, music_dir, identifier, 
         song_start = music_song_start(match)
         track = music_dir / "music_track.mp3"
         _run_ffmpeg(build_align_command(ffmpeg_binary, fetched.path, song_start, duration_s, track))
+        if _audio_duration(ffmpeg_binary, track) < MIN_ALIGNED_SECONDS:
+            track.unlink(missing_ok=True)
+            raise MusicFetchError("aligned music track is empty (song offset past the end of the downloaded track)")
     except Exception as exc:
         print(f"[Music] Could not fetch the track: {exc}")
         return MusicResult("download_failed", {**base, "status": "download_failed", "error": str(exc)})

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .contracts import Artifact, PipelineResult
 from .media import FfmpegFinalAssembler
-from .mixer import DEFAULT_MUSIC_PERCENT, mix_final
+from .mixer import DEFAULT_MUSIC_PERCENT, MixError, mix_final
 from .runner import DirectoryLanguagePipeline, PipelineServices
 from .service_adapters import LocalSubtitleTranslatorAdapter, TextToAudioAdapter
 
@@ -16,7 +16,11 @@ def _mix_dubbed_only(backend, voice: Artifact, music: Artifact, job_id: str) -> 
         root = Path(temp)
         voice_path = backend.download(voice, root / "voice.mp4")
         music_path = backend.download(music, root / "music.mp3")
-        mixed = mix_final(voice_path, music_path, DEFAULT_MUSIC_PERCENT, root / "dubbed.mp4")
+        try:
+            mixed = mix_final(voice_path, music_path, DEFAULT_MUSIC_PERCENT, root / "dubbed.mp4")
+        except MixError as exc:
+            print(f"[Mix] WARNING: music mix failed ({exc}); continuing voice-only.")
+            mixed = mix_final(voice_path, None, DEFAULT_MUSIC_PERCENT, root / "dubbed.mp4")
         artifact = Artifact(uri="artifact://dubbed-mixed.mp4", filename="dubbed-mixed.mp4",
                             content_type="video/mp4", metadata={"path": str(mixed)})
         return backend.publish(artifact, name="dubbed_video.mp4", job_id=job_id)

@@ -13,7 +13,7 @@ from typing import Any
 
 from .contracts import Artifact, AwaitingFaceSelection
 from .media import ArtifactBackend
-from .music import ShazamIdentifier, YouTubeFetcher, identify_and_fetch
+from .music import MusicResult, ShazamIdentifier, YouTubeFetcher, identify_and_fetch
 
 
 SERVICE_A_ROOT = Path(__file__).resolve().parent / "vendor" / "service_a"
@@ -228,12 +228,16 @@ class TextToAudioAdapter:
         # --- Analyze (cached on disk, so a resume after confirmation is cheap) ---
         info = analysis.analyze_video(source, job_dir, source_language)
         music_dir = root / "music"
-        music = identify_and_fetch(
-            source, info["words"], info["duration"], music_dir,
-            self.music_identifier or ShazamIdentifier(),
-            self.music_fetcher or YouTubeFetcher(ffmpeg_location=ffmpeg_binary),
-            ffmpeg_binary=ffmpeg_binary,
-        )
+        try:
+            music = identify_and_fetch(
+                source, info["words"], info["duration"], music_dir,
+                self.music_identifier or ShazamIdentifier(),
+                self.music_fetcher or YouTubeFetcher(ffmpeg_location=ffmpeg_binary),
+                ffmpeg_binary=ffmpeg_binary,
+            )
+        except Exception as exc:  # music is optional; never fail a paid job over it
+            print(f"[Music] Unexpected error, continuing voice-only: {exc}")
+            music = MusicResult("not_identified", {"status": "not_identified", "error": str(exc)})
         print(f"[Music] status={music.status}")
         extras = self._publish_music(music, music_dir, job_id)
 

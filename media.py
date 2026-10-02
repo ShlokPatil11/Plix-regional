@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .contracts import Artifact
-from .mixer import DEFAULT_MUSIC_PERCENT, mix_final
+from .mixer import DEFAULT_MUSIC_PERCENT, MixError, mix_final
 
 
 class ArtifactBackend(Protocol):
@@ -96,10 +96,19 @@ class FfmpegFinalAssembler:
 
             if audio is None:
                 music_path = self.backend.download(music, root / "music.mp3") if music else None
-                mixed = mix_final(
-                    video_path, music_path, music_percent, root / "final_video.mp4",
-                    subtitles=subtitle_path, ffmpeg_binary=self.ffmpeg_binary,
-                )
+                try:
+                    mixed = mix_final(
+                        video_path, music_path, music_percent, root / "final_video.mp4",
+                        subtitles=subtitle_path, ffmpeg_binary=self.ffmpeg_binary,
+                    )
+                except MixError as exc:
+                    if music_path is None:
+                        raise
+                    print(f"[Mix] WARNING: music mix failed ({exc}); continuing voice-only.")
+                    mixed = mix_final(
+                        video_path, None, music_percent, root / "final_video.mp4",
+                        subtitles=subtitle_path, ffmpeg_binary=self.ffmpeg_binary,
+                    )
                 return self.backend.upload(mixed, filename="final_video.mp4", content_type="video/mp4")
 
             # Legacy path: Service B returned audio separately from the video.

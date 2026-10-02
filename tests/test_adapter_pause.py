@@ -99,3 +99,18 @@ def test_music_failure_does_not_block_rendering(env):
     result = run(TextToAudioAdapter(backend), source)
     assert "music_track" not in result
     assert result["music_info"].filename == "music.json"
+
+
+def test_unexpected_music_error_is_a_soft_not_identified_result(env):
+    backend, source, seen, monkeypatch = env
+    monkeypatch.setattr(faces, "load_or_discover", lambda *a, **k: [])
+
+    def boom(*a, **k):
+        raise RuntimeError("yt-dlp exploded")
+
+    monkeypatch.setattr(service_adapters, "identify_and_fetch", boom)
+    result = run(TextToAudioAdapter(backend), source)
+    assert "video" in result and "music_track" not in result
+    published = json.loads((backend.root / "music.json").read_text(encoding="utf-8"))
+    assert published["status"] == "not_identified"
+    assert "yt-dlp exploded" in published["error"]

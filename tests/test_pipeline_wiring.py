@@ -115,3 +115,18 @@ def test_strict_signature_assembler_still_works_when_there_is_no_music(tmp_path)
     assert assembler.called
     assert result.music_track is None
     assert result.manifest["music_track"] is None
+
+
+def test_corrupt_music_artifact_falls_back_to_a_voice_only_final_video(tmp_path, capsys):
+    backend = FileArtifactBackend(tmp_path / "art")
+    voice = artifact(backend, make_video(tmp_path / "v.mp4", seconds=2.0), "v.mp4", "video/mp4")
+    junk = tmp_path / "music_track.mp3"
+    junk.write_bytes(b"\x00garbage" * 25)
+    music = artifact(backend, junk, "music_track.mp3", "audio/mpeg")
+    srt_path = tmp_path / "s.srt"
+    srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n", encoding="utf-8")
+    srt = artifact(backend, srt_path, "s.srt", "application/x-subrip")
+    final = FfmpegFinalAssembler(backend).assemble(voice, None, srt, job_id="j", music=music)
+    types = stream_types(final.metadata["path"])
+    assert "subtitle" in types and "audio" in types and "video" in types
+    assert "voice-only" in capsys.readouterr().out
