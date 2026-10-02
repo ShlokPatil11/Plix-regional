@@ -156,3 +156,125 @@ def load_candidates(path) -> list:
                       crop_file=item.get("crop_file"), recommended=item.get("recommended", False))
         for item in json.loads(Path(path).read_text(encoding="utf-8"))
     ]
+
+
+class FaceEngine:
+    """YuNet detection + SFace embeddings, using the models shipped with Service B."""
+
+    def __init__(self, tracker=None):
+        if tracker is None:
+            from .face_id_tracker import FaceIDTracker
+
+            tracker = FaceIDTracker()
+        self._detector = tracker.detector
+        self._recognizer = tracker.recognizer
+
+    def detect(self, frame_bgr) -> list:
+        height, width = frame_bgr.shape[:2]
+        self._detector.setInputSize((width, height))
+        _, faces = self._detector.detect(frame_bgr)
+        found = []
+        for face in faces if faces is not None else []:
+            aligned = self._recognizer.alignCrop(frame_bgr, face)
+            embedding = self._recognizer.feature(aligned).reshape(-1)
+            x, y, w, h = [int(v) for v in face[:4]]
+            found.append(((x, y, w, h), embedding))
+        return found
+
+
+def _speech_overlaps(words: list, start: float, end: float) -> bool:
+    return any(float(w["end"]) > start and float(w["start"]) < end for w in words)
+
+
+def _crop(frame, box, margin: float = 0.25, max_side: int = 256):
+    height, width = frame.shape[:2]
+    x, y, w, h = box
+    pad_x, pad_y = int(w * margin), int(h * margin)
+    x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
+    x2, y2 = min(width, x + w + pad_x), min(height, y + h + pad_y)
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+    scale = max_side / max(crop.shape[:2])
+    if scale < 1:
+        crop = cv2.resize(crop, None, fx=scale, fy=scale)
+    return crop.copy()
+
+
+def discover_candidates(video_path, scenes: list, words: list, job_dir, engine, *,
+                        samples_per_shot: int = 6, max_candidates: int = MAX_CANDIDATES) -> list:
+    job_dir = Path(job_dir)
+    faces_dir = job_dir / "faces"
+    faces_dir.mkdir(parents=True, exist_ok=True)
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise PipelineError(f"Cannot open video for face detection: {video_path}")
+    observations = []
+    try:
+        for index, scene in enumerate(scenes):
+            start, end = float(scene["start"]), float(scene["end"])
+            if not _speech_overlaps(words, start, end):
+                continue
+            duration = end - start
+            count = max(1, min(samples_per_shot, int(duration * 2)))
+            weight = duration / count
+            for k in range(count):
+                moment = start + duration * (k + 0.5) / count
+                capture.set(cv2.CAP_PROP_POS_MSEC, moment * 1000.0)
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    continue
+                frame_h = frame.shape[0]
+                for box, embedding in engine.detect(frame):
+                    if box[3] < MIN_FACE_HEIGHT_RATIO * frame_h:
+                        continue
+                    observations.append(FaceObs(index, moment, box, frame_h, embedding, weight, _crop(frame, box)))
+    finally:
+        capture.release()
+    candidates = rank_candidates(cluster_observations(observations), max_candidates)
+    for candidate in candidates:
+        if candidate.crop is not None:
+            name = f"face_cand_{candidate.id}.jpg"
+            cv2.imwrite(str(faces_dir / name), candidate.crop)
+            candidate.crop_file = name
+    save_candidates(job_dir / "face_candidates.json", candidates)
+    print(f"[Faces] {len(candidates)} face candidate(s) found.")
+    return candidates
+
+
+def load_or_discover(video_path, scenes: list, words: list, job_dir, engine=None) -> list:
+    saved = Path(job_dir) / "face_candidates.json"
+    if saved.is_file():
+        return load_candidates(saved)
+    return discover_candidates(video_path, scenes, words, job_dir, engine or FaceEngine())
+
+
+def locked_boxes_for_clip(clip_path, engine, lock: FaceLock, threshold: float = SAME_PERSON):
+    """Per-frame [x1, y1, x2, y2] of the locked identity (None where absent) and the presence ratio."""
+    anchor = lock.vector()
+    capture = cv2.VideoCapture(str(clip_path))
+    boxes = []
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                break
+            best, best_similarity = None, threshold
+            for box, embedding in engine.detect(frame):
+                similarity = cosine(anchor, embedding)
+                if similarity >= best_similarity:
+                    best, best_similarity = box, similarity
+            if best is None:
+                boxes.append(None)
+            else:
+                x, y, w, h = best
+                boxes.append([max(0, x), max(0, y), max(0, x + w), max(0, y + h)])
+    finally:
+        capture.release()
+    present = sum(box is not None for box in boxes)
+    return boxes, (present / len(boxes) if boxes else 0.0)
+
+
+def build_sync_options(boxes: list) -> dict:
+    """Sync Labs active_speaker_detection payload: only the locked face is animated."""
+    return {"auto_detect": False, "bounding_boxes": boxes}
