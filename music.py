@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -114,7 +115,7 @@ def choose_youtube_result(
             continue
         name = (entry.get("title") or "").lower()
         channel = (entry.get("channel") or entry.get("uploader") or "").lower()
-        if any(word in name and word not in wanted for word in _BANNED):
+        if any(re.search(rf"\b{re.escape(word)}\b", name) and not re.search(rf"\b{re.escape(word)}\b", wanted) for word in _BANNED):
             continue
         if track_length_s:
             if abs(duration - track_length_s) > max(8.0, 0.08 * track_length_s):

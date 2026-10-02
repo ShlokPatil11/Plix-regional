@@ -95,3 +95,40 @@ def test_parse_shazam_result():
     assert parse_shazam_result({"matches": []}) is None
     assert parse_shazam_result({"track": {"subtitle": "no title"}}) is None
     assert parse_shazam_result({"track": {"title": "T"}}).offset_s == 0.0
+
+
+def test_banned_words_only_candidates_returns_none():
+    """When only live/cover entries match duration, return None."""
+    entries = [
+        entry("Artist - Song (Live at Wembley)", 215, channel="Artist - Topic", id_="live"),
+        entry("Artist - Song (Cover)", 214, id_="cover"),
+    ]
+    result = choose_youtube_result(entries, artist="Artist", title="Song", track_length_s=215)
+    assert result is None
+
+
+def test_word_boundary_allows_banned_words_in_other_contexts():
+    """Entries with banned words in non-word-boundary contexts are accepted."""
+    entries = [
+        entry("Artist - Song (Official Audio) [Discovery]", 215, id_="discovery"),
+        entry("Artist - Alive Again (Official Audio)", 215, id_="alive"),
+    ]
+    # "Discovery" contains "cover" but is not a word-boundary match
+    # "Alive Again" contains "live" but is not a word-boundary match
+    # Both should be accepted by the filter (not None)
+    result1 = choose_youtube_result(entries, artist="Artist", title="Song", track_length_s=215)
+    assert result1 is not None and result1["id"] in ("discovery", "alive")
+
+    result2 = choose_youtube_result(entries, artist="Artist", title="Alive Again", track_length_s=215)
+    assert result2 is not None and result2["id"] in ("discovery", "alive")
+
+
+def test_artist_name_does_not_exempt_live_results():
+    """Artist name like 'Oliver Tree' does not exempt a 'Live' result."""
+    entries = [
+        entry("Oliver Tree - Song (Live)", 200, id_="live"),
+    ]
+    # "Oliver" contains "live" but should not match as a word boundary
+    # but the title still has (Live) which should be rejected
+    result = choose_youtube_result(entries, artist="Oliver Tree", title="Song", track_length_s=200)
+    assert result is None
