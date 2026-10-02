@@ -80,7 +80,7 @@ The anchor is the mean embedding of the chosen identity, saved to `face_lock.jso
 - For lip-synced shots, build per-frame `bounding_boxes` for the locked face (`[x1,y1,x2,y2]`, `null` where absent) and send them as `options.active_speaker_detection.bounding_boxes` with `auto_detect` off. Verified against Sync's Speaker Selection docs (https://docs.sync.so/developer-guides/speaker-selection). Fallback if boxes prove flaky: `frame_number` plus `coordinates` (must be sent together).
 - Otherwise the shot is B-roll: dubbed audio over the original video.
 - Existing fallbacks stay: clips under 1 second and Sync Labs errors get an audio-only mux.
-- `classifier.classify_shot` currently ignores identity for A-roll gating. That changes: identity gates A-roll once a lock exists. Per-shot decisions are recorded in `scenes.json`.
+- `classifier.classify_shot` is unchanged. The analyze phase runs before a face is locked, so the identity gate is applied at render time inside `lipsyncer.process_shots`. Per-shot decisions (`lip_sync`, `locked_face_ratio`) are written back to `scenes.json`.
 
 ### Risks
 
@@ -125,7 +125,7 @@ Pulling commercial tracks from YouTube is a licensing and terms-of-service issue
   - `POST /api/jobs/{id}/remix` with `{music_percent}`: re-run the mix only.
 - A job awaiting confirmation for 24 hours expires.
 - A restart while awaiting confirmation leaves the job awaiting.
-- New artifacts: `music_track.mp3`, `music.json`, `voice_video.mp4`.
+- New artifacts: `music_track.mp3`, `music.json`, `voice_video.mp4` (published in both Combine and Dubbing operations).
 
 ## UI (`static/index.html`)
 
@@ -139,11 +139,10 @@ Every soft failure degrades to voice-only or audio-only and is written to `proce
 
 ## Changes to existing code
 
-- New modules in the app: `faces.py`, `music.py`, `mixer.py`.
+- New modules in the app: `music.py`, `mixer.py`. `faces.py` and `analysis.py` live in `vendor/service_b/src/` because `lipsyncer.py` imports them and the face models live there.
 - `api.py`, `job_store.py`, `in_process.py`, `service_adapters.py`: pause/resume, new endpoints, wiring.
 - Vendored `engine.py`: split into analyze and render phases.
 - Vendored `lipsyncer.py`: locked-face gating and `bounding_boxes`.
-- Vendored `classifier.py`: identity gates A-roll.
 - Vendored `el_dubber.py`: request voice-only audio (drop background).
 - `requirements.txt`: `yt-dlp`, `shazamio`, `pytest`.
 
