@@ -46,7 +46,7 @@ def build_mix_command(
     command += ["-map", "0:v:0"]
     if use_music:
         graph = (
-            f"[1:a]loudnorm=I=-16:TP=-1.5:LRA=11,volume={gain:.4f}[m];"
+            f"[1:a]loudnorm=I=-16:TP=-1.5:LRA=11,volume={gain:.4f},apad[m];"
             "[0:a][m]amix=inputs=2:duration=first:dropout_transition=0,volume=2,alimiter=limit=0.95[a]"
         )
         command += ["-filter_complex", graph, "-map", "[a]"]

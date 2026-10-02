@@ -60,3 +60,19 @@ def test_failure_raises_mix_error_and_leaves_no_partial_file(media, tmp_path):
         mix_final(missing, music, 30, out)
     assert not out.exists()
     assert not list(tmp_path.glob(".out.*"))
+
+
+def test_short_music_does_not_spike_voice_level_in_tail(tmp_path):
+    """Regression: when music shorter than voice, amix renormalizes voice at cutoff.
+
+    Without apad fix: voice in tail becomes ~6 dB louder after music ends.
+    With fix: voice level stays constant throughout.
+    """
+    voice = make_video(tmp_path / "voice.mp4", seconds=4.0, freq=300)
+    music = make_tone(tmp_path / "music.mp3", seconds=1.0, freq=800)
+    out50 = mix_final(voice, music, 50, tmp_path / "out50.mp4")
+    out0 = mix_final(voice, music, 0, tmp_path / "out0.mp4")
+    # Measure tail window (2.5s onwards, after music ends at 1.0s)
+    tail50 = mean_volume_db(out50, start=2.5, duration=1.0)
+    tail0 = mean_volume_db(out0, start=2.5, duration=1.0)
+    assert abs(tail50 - tail0) < 1.5
