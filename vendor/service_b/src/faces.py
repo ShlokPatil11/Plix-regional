@@ -253,14 +253,19 @@ def locked_boxes_for_clip(clip_path, engine, lock: FaceLock, threshold: float = 
     """Per-frame [x1, y1, x2, y2] of the locked identity (None where absent) and the presence ratio."""
     anchor = lock.vector()
     capture = cv2.VideoCapture(str(clip_path))
+    if not capture.isOpened():
+        raise PipelineError(f"Cannot open clip for face tracking: {clip_path}")
     boxes = []
     try:
         while True:
             ok, frame = capture.read()
             if not ok or frame is None:
                 break
+            frame_h = frame.shape[0]
             best, best_similarity = None, threshold
             for box, embedding in engine.detect(frame):
+                if box[3] < MIN_FACE_HEIGHT_RATIO * frame_h:
+                    continue
                 similarity = cosine(anchor, embedding)
                 if similarity >= best_similarity:
                     best, best_similarity = box, similarity
@@ -271,6 +276,8 @@ def locked_boxes_for_clip(clip_path, engine, lock: FaceLock, threshold: float = 
                 boxes.append([max(0, x), max(0, y), max(0, x + w), max(0, y + h)])
     finally:
         capture.release()
+    if not boxes:
+        raise PipelineError(f"No frames read from clip: {clip_path}")
     present = sum(box is not None for box in boxes)
     return boxes, (present / len(boxes) if boxes else 0.0)
 
