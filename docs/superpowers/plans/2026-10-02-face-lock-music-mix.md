@@ -50,7 +50,7 @@ Failure modes the spec implies that no single feature task would otherwise pin d
 |---|---|---|
 | `requirements.txt` | modify | add `yt-dlp`, `shazamio`, `audioop-lts` (py3.13 only), `pytest` in dev file |
 | `requirements-dev.txt` | create | `-r requirements.txt` + `pytest` |
-| `pytest.ini` | create | test discovery |
+| `tests/pytest.ini` | create | import mode (must live in tests/, see Task 0) |
 | `tests/conftest.py`, `tests/helpers.py` | create | package registration, ffmpeg media helpers |
 | `mixer.py` | create | voice + music x percent mix, subtitle track attach |
 | `music.py` | create | window picking, Shazam identifier, YouTube fetcher, alignment, `identify_and_fetch` |
@@ -75,7 +75,7 @@ Failure modes the spec implies that no single feature task would otherwise pin d
 ### Task 0: Test scaffolding and dependencies
 
 **Files:**
-- Create: `requirements-dev.txt`, `pytest.ini`, `tests/conftest.py`, `tests/helpers.py`, `tests/test_smoke.py`
+- Create: `requirements-dev.txt`, `tests/pytest.ini`, `tests/conftest.py`, `tests/helpers.py`, `tests/test_smoke.py`
 - Modify: `requirements.txt`
 
 **Interfaces:**
@@ -98,11 +98,11 @@ Create `requirements-dev.txt`:
 pytest>=8,<10
 ```
 
-Create `pytest.ini`:
+Create `tests/pytest.ini` (it must live in `tests/`: the repo directory name `Plix-Project-1` contains a hyphen, so an ini at the repo root makes pytest try to import the root `__init__.py` as a package and fail). Always run pytest as `.venv/bin/python -m pytest tests ...` from the repo root; a bare `pytest -q` is not supported.
 
 ```ini
 [pytest]
-testpaths = tests
+addopts = --import-mode=importlib
 ```
 
 - [ ] **Step 2: Install and smoke-check the new libraries**
@@ -232,7 +232,7 @@ Expected: 2 passed.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add requirements.txt requirements-dev.txt pytest.ini tests/
+git add requirements.txt requirements-dev.txt tests/
 git commit -m "test: add pytest scaffolding and media helpers
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
@@ -1910,7 +1910,7 @@ Expected: 5 passed. Note: the fake Sync client records the raw clip as the first
 
 - [ ] **Step 7: Run the whole suite and commit**
 
-Run: `.venv/bin/python -m pytest -q`
+Run: `.venv/bin/python -m pytest tests -q`
 Expected: all previous tests still pass.
 
 ```bash
@@ -2667,7 +2667,7 @@ Replace the body of the `dubbing` branch after `output = TextToAudioAdapter(...)
 
 - [ ] **Step 11: Run adapter tests and the whole suite**
 
-Run: `.venv/bin/python -m pytest tests/test_adapter_pause.py tests/test_pipeline_wiring.py -v` then `.venv/bin/python -m pytest -q`
+Run: `.venv/bin/python -m pytest tests/test_adapter_pause.py tests/test_pipeline_wiring.py -v` then `.venv/bin/python -m pytest tests -q`
 Expected: all pass. If `test_a_choice_renders...` errors on `kwargs.get("face_lock")`, confirm the adapter passes `face_lock=lock` by keyword.
 
 - [ ] **Step 12: Commit**
@@ -3157,7 +3157,7 @@ def remix(job_id: str, body: RemixRequest):
 
 - [ ] **Step 4: Run to verify pass**
 
-Run: `.venv/bin/python -m pytest tests/test_api.py -v` then `.venv/bin/python -m pytest -q`
+Run: `.venv/bin/python -m pytest tests/test_api.py -v` then `.venv/bin/python -m pytest tests -q`
 Expected: all pass. If `importlib.reload(api_module)` raises because the module is not importable as `dir_language_pipeline.api`, confirm `tests/conftest.py` registers the package (Task 0).
 
 - [ ] **Step 5: Commit**
@@ -3380,7 +3380,7 @@ Add to the Artifacts list: `voice_video` (voice-only video before the music mix)
 
 - [ ] **Step 2: Run the entire test suite**
 
-Run: `.venv/bin/python -m pytest -v`
+Run: `.venv/bin/python -m pytest tests -v`
 Expected: every test passes (roughly 85 tests). No test touches the network.
 
 - [ ] **Step 3: Check nothing paid or secret is committed**
