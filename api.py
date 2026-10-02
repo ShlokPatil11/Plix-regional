@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
+import json
 import logging
 import mimetypes
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import threading
@@ -14,11 +16,13 @@ from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
+from pydantic import BaseModel, Field
 
-from .contracts import PipelineStageError
+from .contracts import AwaitingFaceSelection, PipelineStageError
 from .in_process import run_operation
 from .job_store import JobStore
 from .media import FileArtifactBackend
+from .mixer import MixError, mix_final
 from .service_adapters import LANGUAGES
 
 
@@ -29,6 +33,27 @@ JOB_ROOT.mkdir(parents=True, exist_ok=True)
 store = JobStore(DATA_DIR / "jobs.sqlite3")
 stop_worker = threading.Event()
 worker_thread: threading.Thread | None = None
+CROP_NAME = re.compile(r"^face_cand_\d+\.jpg$")
+remix_lock = threading.Lock()
+
+
+class FaceChoice(BaseModel):
+    candidate_id: str
+
+
+class RemixRequest(BaseModel):
+    music_percent: int = Field(ge=0, le=100)
+
+
+def _artifacts_dir(job_id: str) -> Path:
+    return JOB_ROOT / job_id / "artifacts"
+
+
+def _read_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
 
 
 class _TerminalAndFileStream:
@@ -98,6 +123,7 @@ def _process_job(job: dict) -> None:
                         source_language=job["source_language"],
                         backend=backend,
                         job_id=job_id,
+                        face_choice=job.get("face_choice"),
                         on_stage=lambda value: (store.stage(job_id, value), print(f"--- stage: {value} ---", flush=True)),
                     )
             finally:
@@ -107,6 +133,11 @@ def _process_job(job: dict) -> None:
             name: artifact.metadata["path"] for name, artifact in result.items()
         }
         store.finish(job_id, output_artifacts)
+    except AwaitingFaceSelection:
+        store.await_face(job_id)
+        print(f"[job {job_id}] waiting for the user to confirm which face to lip-sync",
+              file=sys.__stderr__ or sys.stderr, flush=True)
+        return
     except Exception as exc:
         stage = exc.stage if isinstance(exc, PipelineStageError) else "processing"
         trace = traceback.format_exc()
@@ -123,6 +154,7 @@ def _worker() -> None:
     while not stop_worker.is_set():
         job = None
         try:
+            store.expire_stale()
             job = store.claim()
             if job is None:
                 stop_worker.wait(0.5)
@@ -229,6 +261,7 @@ def job_status(job_id: str):
         "source_language": record["source_language"],
         "operation": record["operation"],
         "error": record["error"],
+        "music": _read_json(_artifacts_dir(job_id) / "music.json"),
         "artifacts": {
             name: f"/api/jobs/{job_id}/artifacts/{name}"
             for name in record["artifacts"]
@@ -271,5 +304,79 @@ def get_artifact(job_id: str, name: str):
     allowed = (JOB_ROOT / job_id / "artifacts").resolve()
     if allowed not in path.parents or not path.is_file():
         raise HTTPException(404, "Artifact not available")
-    media = "video/mp4" if path.suffix.lower() == ".mp4" else "application/x-subrip" if path.suffix.lower() == ".srt" else "application/octet-stream"
+    suffix = path.suffix.lower()
+    media = {
+        ".mp4": "video/mp4", ".srt": "application/x-subrip", ".mp3": "audio/mpeg",
+        ".json": "application/json", ".jpg": "image/jpeg",
+    }.get(suffix, "application/octet-stream")
     return FileResponse(path, media_type=media, filename=path.name)
+
+
+@app.get("/api/jobs/{job_id}/faces")
+def get_faces(job_id: str):
+    record = store.get(job_id)
+    if record is None:
+        raise HTTPException(404, "Job not found")
+    panel = _read_json(_artifacts_dir(job_id) / "faces.json")
+    if panel is None:
+        raise HTTPException(404, "No face choices available for this job")
+    return {
+        "status": record["status"],
+        "candidates": panel["candidates"],
+        "music": _read_json(_artifacts_dir(job_id) / "music.json"),
+    }
+
+
+@app.get("/api/jobs/{job_id}/faces/{filename}")
+def get_face_crop(job_id: str, filename: str):
+    if store.get(job_id) is None:
+        raise HTTPException(404, "Job not found")
+    if not CROP_NAME.match(filename):
+        raise HTTPException(404, "Crop not found")
+    path = _artifacts_dir(job_id) / filename
+    if not path.is_file():
+        raise HTTPException(404, "Crop not found")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.post("/api/jobs/{job_id}/face")
+def confirm_face(job_id: str, body: FaceChoice):
+    record = store.get(job_id)
+    if record is None:
+        raise HTTPException(404, "Job not found")
+    panel = _read_json(_artifacts_dir(job_id) / "faces.json")
+    if panel is None:
+        raise HTTPException(409, "This job has no face choices to confirm")
+    if body.candidate_id not in {candidate["id"] for candidate in panel["candidates"]}:
+        raise HTTPException(422, "Unknown face candidate")
+    outcome = store.confirm_face(job_id, body.candidate_id)
+    if outcome == "not_awaiting":
+        raise HTTPException(409, "This job is not waiting for a face choice")
+    return {"status": store.get(job_id)["status"]}
+
+
+@app.post("/api/jobs/{job_id}/remix")
+def remix(job_id: str, body: RemixRequest):
+    record = store.get(job_id)
+    if record is None:
+        raise HTTPException(404, "Job not found")
+    if record["status"] != "completed":
+        raise HTTPException(409, "The job has not completed yet")
+    art = _artifacts_dir(job_id)
+    info = _read_json(art / "music.json")
+    voice, track = art / "voice_video.mp4", art / "music_track.mp3"
+    if not info or info.get("status") != "ok" or not voice.is_file() or not track.is_file():
+        raise HTTPException(409, "No identified music track for this job")
+    final_path = record["artifacts"].get("final_video")
+    if not final_path:
+        raise HTTPException(409, "The job has no final video to rebuild")
+    subtitles = art / "visual_subtitles.srt"
+    try:
+        with remix_lock:
+            mix_final(voice, track, body.music_percent, Path(final_path),
+                      subtitles=subtitles if subtitles.is_file() else None)
+            info["percent"] = body.music_percent
+            (art / "music.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+    except MixError as exc:
+        raise HTTPException(500, str(exc)) from exc
+    return {"music_percent": body.music_percent, "final_video": f"/api/jobs/{job_id}/artifacts/final_video"}
