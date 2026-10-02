@@ -55,3 +55,36 @@ def test_analysis_returns_words_scenes_and_reuses_scene_cache(tmp_path, monkeypa
 
 def test_engine_accepts_a_face_lock():
     assert "face_lock" in inspect.signature(engine.run_dubbing_engine).parameters
+
+
+def test_engine_passes_the_face_lock_to_process_shots_and_saves_the_decisions(tmp_path, monkeypatch):
+    from src.faces import FaceLock
+
+    video = make_video(tmp_path / "v.mp4", seconds=2.0)
+    job = tmp_path / "job"
+    lock = FaceLock.disabled()
+    seen = {}
+
+    monkeypatch.setattr(engine, "extract_transcript",
+                        lambda **kwargs: (job / "t.srt", [{"word": "hi", "start": 0.1, "end": 0.5}]))
+    monkeypatch.setattr(
+        engine, "classify_video",
+        lambda **kwargs: [{"start": 0.0, "end": 2.0, "class": "A_ROLL"}],
+    )
+    monkeypatch.setattr(
+        engine, "run_dubbing",
+        lambda **kwargs: (job / "dub.mp3", job / "dub.srt", None),
+    )
+
+    def fake_process_shots(**kwargs):
+        seen["lock"] = kwargs.get("lock")
+        kwargs["classified_scenes"][0]["lip_sync"] = False
+        return [job / "clip.mp4"]
+
+    monkeypatch.setattr(engine, "process_shots", fake_process_shots)
+    monkeypatch.setattr(engine, "stitch_segments", lambda **kwargs: None)
+
+    engine.run_dubbing_engine(video, "hi", job_dir=job, dry_run=False, face_lock=lock)
+    assert seen["lock"] is lock
+    saved = json.loads((job / "scenes.json").read_text(encoding="utf-8"))
+    assert saved[0]["lip_sync"] is False
