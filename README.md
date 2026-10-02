@@ -22,7 +22,7 @@ From this directory, install `requirements.txt`, install FFmpeg and Tesseract, c
 uvicorn dir_language_pipeline.api:app --host 0.0.0.0 --port 8000
 ```
 
-Open `http://localhost:8000`. Choose **Masking** to run Service A alone, **Dubbing** to run Service B alone on the uploaded video, or **Combine** to run Service A followed by Service B and mux their outputs. Each action accepts the selected target language and optional spoken source language. `POST /api/jobs` accepts the same fields plus `operation` (`masking`, `dubbing`, or `combine`; defaults to `combine`). It returns a job ID; Dubbing and Combine pause at `awaiting_face_selection` after analysis until the face is confirmed (via the job page or `POST /api/jobs/{job_id}/face`), then continue. Masking is unchanged and does not pause. Poll `GET /api/jobs/{job_id}` and download the artifacts returned when processing completes.
+Open `http://localhost:8000`. Choose **Masking** to run Service A alone, **Dubbing** to run Service B alone on the uploaded video, or **Combine** to run Service A followed by Service B and mux their outputs. Each action accepts the selected target language and optional spoken source language. `POST /api/jobs` accepts the same fields plus `operation` (`masking`, `dubbing`, or `combine`; defaults to `combine`). It returns a job ID; Dubbing and Combine pause at `awaiting_face_selection` after analysis until the face is confirmed (in the UI, or via `POST /api/jobs/{job_id}/face`), then continue; a job in which no usable face is found skips the pause. Masking is unchanged and does not pause. Poll `GET /api/jobs/{job_id}` and download the artifacts returned when processing completes.
 
 ## Run with Docker
 
@@ -60,7 +60,7 @@ Always pass `tests` (not just `pytest -q`) because the project directory name co
 
 ## Face lock and background music
 
-Dubbing and Combine pause for face confirmation. The job page shows the faces that appear while someone speaks; confirm the speaker via `GET /api/jobs/{job_id}/faces` or the job page, then resume via `POST /api/jobs/{job_id}/face` with `{"candidate_id": "0"}`. Only shots where that person is visible are lip-synced; Sync Labs receives per-frame bounding boxes of the locked face. If no face is found the video is dubbed audio-only. Jobs waiting for confirmation expire after 24 hours.
+Dubbing and Combine pause for face confirmation. The UI shows the faces that appear while someone speaks; confirm the speaker there, or via `GET /api/jobs/{job_id}/faces`. The UI puts the job ID in the address bar, so if you reload or close the tab, reopen the app URL with `?job=<job_id>` (for example `http://localhost:8000/?job=<job_id>`) to pick the job up again. You can also resume via `POST /api/jobs/{job_id}/face` with `{"candidate_id": "0"}`. Only shots where that person is visible are lip-synced; Sync Labs receives per-frame bounding boxes of the locked face. If no face is found the video is dubbed audio-only and the job does not pause. Jobs waiting for confirmation expire after 24 hours.
 
 The ad's background music is identified with Shazam (`shazamio`, no API key), downloaded from YouTube with `yt-dlp`, aligned to the video, and mixed with the dubbed voice. Use the **Music level** slider on the result page (or `POST /api/jobs/{job_id}/remix` with `{"music_percent": 0-100}`) to change the mix; the default level is 25%, and changing it runs only ffmpeg. If the music is not identified or cannot be downloaded the video is voice-only and the slider is disabled. `music.json` records the artist, title, and YouTube URL used.
 
@@ -68,7 +68,7 @@ The job status response now includes a `music` field. Downloading commercial tra
 
 ## Process logs and failures
 
-The worker prefixes each job's Python output and stage changes with its job ID and streams them to the terminal/container log where Uvicorn is running. It also saves the complete stdout, stderr, Python logging output, and failure traceback in that job's `process.log`. Open **View complete process log** on the job page, or fetch `GET /api/jobs/{job_id}/logs`. The job status response includes the underlying Service A or Service B error when available.
+The worker prefixes each job's Python output and stage changes with its job ID and streams them to the terminal/container log where Uvicorn is running. It also saves the complete stdout, stderr, Python logging output, and failure traceback in that job's `process.log`. Open **View complete process log** in the UI, or fetch `GET /api/jobs/{job_id}/logs`. The job status response includes the underlying Service A or Service B error when available.
 
 On a fresh deployment, Service B downloads its faster-whisper model at runtime. The host must allow outbound access to the configured AI providers and model service.
 
