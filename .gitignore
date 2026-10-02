@@ -7,3 +7,4 @@ __pycache__/
 jobs/
 *.sqlite3
 *.db
+.DS_Store
