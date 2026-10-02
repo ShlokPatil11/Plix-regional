@@ -22,7 +22,7 @@ From this directory, install `requirements.txt`, install FFmpeg and Tesseract, c
 uvicorn dir_language_pipeline.api:app --host 0.0.0.0 --port 8000
 ```
 
-Open `http://localhost:8000`. Choose **Masking** to run Service A alone, **Dubbing** to run Service B alone on the uploaded video, or **Combine** to run Service A followed by Service B and mux their outputs. Each action accepts the selected target language and optional spoken source language. `POST /api/jobs` accepts the same fields plus `operation` (`masking`, `dubbing`, or `combine`; defaults to `combine`). It returns a job ID; poll `GET /api/jobs/{job_id}` and download the artifacts returned when processing completes.
+Open `http://localhost:8000`. Choose **Masking** to run Service A alone, **Dubbing** to run Service B alone on the uploaded video, or **Combine** to run Service A followed by Service B and mux their outputs. Each action accepts the selected target language and optional spoken source language. `POST /api/jobs` accepts the same fields plus `operation` (`masking`, `dubbing`, or `combine`; defaults to `combine`). It returns a job ID; Dubbing and Combine pause at `awaiting_face_selection` after analysis until the face is confirmed (via the job page or `POST /api/jobs/{job_id}/face`), then continue. Masking is unchanged and does not pause. Poll `GET /api/jobs/{job_id}` and download the artifacts returned when processing completes.
 
 ## Run with Docker
 
@@ -39,20 +39,6 @@ docker build -t directory-language-studio .
 docker run --env-file .env -p 8000:8000 -v directory-language-data:/data directory-language-studio
 ```
 
-## Face lock and background music
-
-Dubbing and Combine now pause after analysis. The job page shows the faces that appear while someone speaks; confirm the speaker and the job resumes (`POST /api/jobs/{job_id}/face` with `{"candidate_id": "0"}`). Only shots where that person is visible are lip-synced; Sync Labs receives per-frame bounding boxes of the locked face. If no face is found the video is dubbed audio-only. Jobs waiting for confirmation expire after 24 hours.
-
-The ad's background music is identified with Shazam (`shazamio`, no API key), downloaded from YouTube with `yt-dlp`, aligned to the video, and mixed with the dubbed voice. Use the **Music level** slider on the result page (or `POST /api/jobs/{job_id}/remix` with `{"music_percent": 0-100}`) to change the mix; this runs only ffmpeg. If the music is not identified or cannot be downloaded the video is voice-only and the slider is disabled. `music.json` records the artist, title, and YouTube URL used.
-
-Downloading commercial tracks from YouTube is a licensing and terms-of-service decision for ads that will run; review it before shipping.
-
-To run the tests, use:
-
-```sh
-.venv/bin/python -m pytest tests -q
-```
-
 Configure the required secrets in `.env`:
 
 - `GEMINI_API_KEY` for Service A visual translation (default model: `gemini-3.6-flash`). Create the key in Google AI Studio and set it as a deployment secret. Set `TRANSLATION_PROVIDER=claude` plus `ANTHROPIC_API_KEY` and `TRANSLATION_MODEL` only if you want Claude instead.
@@ -61,6 +47,24 @@ Configure the required secrets in `.env`:
 - `HF_TOKEN` is optional for the configured Hugging Face lip-sync path.
 
 Jobs and generated artifacts live in the mounted `/data` volume. `PIPELINE_MAX_UPLOAD_BYTES` controls the upload limit. Run one API process per data volume because the embedded services use process-wide Python module state; the included worker serializes media jobs.
+
+## Run the tests
+
+From the project root, run:
+
+```sh
+.venv/bin/python -m pytest tests -q
+```
+
+Always pass `tests` (not just `pytest -q`) because the project directory name contains a hyphen, which makes a bare `pytest` fail to collect from the hyphenated `Plix-Project-1` path.
+
+## Face lock and background music
+
+Dubbing and Combine pause for face confirmation. The job page shows the faces that appear while someone speaks; confirm the speaker via `GET /api/jobs/{job_id}/faces` or the job page, then resume via `POST /api/jobs/{job_id}/face` with `{"candidate_id": "0"}`. Only shots where that person is visible are lip-synced; Sync Labs receives per-frame bounding boxes of the locked face. If no face is found the video is dubbed audio-only. Jobs waiting for confirmation expire after 24 hours.
+
+The ad's background music is identified with Shazam (`shazamio`, no API key), downloaded from YouTube with `yt-dlp`, aligned to the video, and mixed with the dubbed voice. Use the **Music level** slider on the result page (or `POST /api/jobs/{job_id}/remix` with `{"music_percent": 0-100}`) to change the mix; the default level is 25%, and changing it runs only ffmpeg. If the music is not identified or cannot be downloaded the video is voice-only and the slider is disabled. `music.json` records the artist, title, and YouTube URL used.
+
+The job status response now includes a `music` field. Downloading commercial tracks from YouTube is a licensing and terms-of-service decision for ads that will run; review it before shipping.
 
 ## Process logs and failures
 
