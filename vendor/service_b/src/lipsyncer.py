@@ -22,6 +22,13 @@ from .common import PipelineError
 from .scene_analyzer import get_video_info, extract_subclip
 from .synclabs_client import SyncLabsClient
 from .audio import ffmpeg
+from .faces import (
+    FaceEngine,
+    FaceLock,
+    LOCK_MIN_PRESENCE,
+    build_sync_options,
+    locked_boxes_for_clip,
+)
 
 
 def _file_hash(path: Path) -> str:
@@ -82,6 +89,13 @@ def _copy_source_clip(
     return out_path
 
 
+def _audio_only_clip(raw_clip: Path, audio_slice: Path, out_path: Path, duration_s: float) -> Path:
+    """Dubbed audio over the untouched video (no mouth edit)."""
+    if not out_path.exists():
+        _mux_audio_onto_video(raw_clip, audio_slice, out_path, duration_s)
+    return out_path
+
+
 def process_shots(
     video_path: Path,
     dubbed_audio: Path,
@@ -89,6 +103,8 @@ def process_shots(
     job_dir: Path,
     sync_model: str = "lipsync-2-pro",
     dry_run: bool = False,
+    lock: "FaceLock | None" = None,
+    face_engine=None,
 ) -> list[Path]:
     """
     Stage 4 entry point.
@@ -97,6 +113,11 @@ def process_shots(
     A_ROLL → Sync Labs lip-sync (cached by content hash)
     B_ROLL → Original video + dubbed audio mux
     SILENT → Original video clip (untouched)
+
+    lock=None keeps the legacy behavior (Sync Labs auto-detects the speaker).
+    A disabled lock (no face to lock) dubs audio-only. An enabled lock lip-syncs a
+    shot only when the locked identity is present in >= LOCK_MIN_PRESENCE of its
+    frames, sending that identity's per-frame bounding boxes to Sync Labs.
     """
     job_dir = Path(job_dir)
     seg_dir = job_dir / "segments"
@@ -111,6 +132,9 @@ def process_shots(
         sync_client = SyncLabsClient(default_model=sync_model)
 
     output_clips: list[Path] = []
+    lock_tag = f"_{lock.tag}" if lock is not None else ""
+    if lock is not None and lock.enabled and face_engine is None and not dry_run:
+        face_engine = FaceEngine()
 
     for i, scene in enumerate(classified_scenes):
         start_s = scene["start"]
@@ -150,32 +174,30 @@ def process_shots(
             output_clips.append(out)
 
         else:  # A_ROLL
-            # Content-hash cache — reuse if already synced
+            # Content-hash cache — reuse if already synced for this exact face lock
             clip_hash = _file_hash(raw_clip) + _file_hash(audio_slice)
-            synced_out = seg_dir / f"{prefix}_{time_key}_{clip_hash}_synced.mp4"
+            synced_out = seg_dir / f"{prefix}_{time_key}_{clip_hash}{lock_tag}_synced.mp4"
 
-            # Check for existing synced clip:
-            # 1. Exact hash match
-            # 2. Or existing synced file for this exact shot prefix and time range
             synced_found = None
             if synced_out.exists():
                 synced_found = synced_out
             else:
-                candidates = sorted(seg_dir.glob(f"{prefix}_{time_key}_*_synced.mp4"))
+                candidates = sorted(seg_dir.glob(f"{prefix}_{time_key}_*{lock_tag}_synced.mp4"))
                 if candidates:
                     synced_found = candidates[0]
 
             if synced_found:
                 print(f"  [LipSync] A-Roll → cached synced clip reused: {synced_found.name} (dur={duration_s:.2f}s)")
+                scene["lip_sync"] = "cached"
                 output_clips.append(synced_found)
                 continue
 
             if dry_run:
                 # In dry-run: mux audio without lip-sync (for testing)
                 dry_out = seg_dir / f"{prefix}_{time_key}_aroll_dryrun.mp4"
-                if not dry_out.exists():
-                    _mux_audio_onto_video(raw_clip, audio_slice, dry_out, duration_s)
+                _audio_only_clip(raw_clip, audio_slice, dry_out, duration_s)
                 print(f"  [LipSync] A-Roll → DRY RUN, muxed without sync")
+                scene["lip_sync"] = "dry_run"
                 output_clips.append(dry_out)
                 continue
 
@@ -190,10 +212,46 @@ def process_shots(
                 print(f"  [LipSync] A-Roll → clip too short ({actual_dur:.2f}s < {MIN_SYNC_DURATION}s) "
                       f"— falling back to B-Roll mux")
                 fallback_out = seg_dir / f"{prefix}_{time_key}_short_fallback.mp4"
-                if not fallback_out.exists():
-                    _mux_audio_onto_video(raw_clip, audio_slice, fallback_out, actual_dur)
+                _audio_only_clip(raw_clip, audio_slice, fallback_out, actual_dur)
+                scene["lip_sync"] = "skipped_short"
                 output_clips.append(fallback_out)
                 continue
+
+            # --- Face lock gate ---
+            options = {
+                "sync_mode": "cut_off",
+                "active_speaker_detection": {"auto_detect": True},
+            }
+            if lock is not None:
+                if not lock.enabled:
+                    print(f"  [LipSync] A-Roll → no face locked for this video; dubbing audio only")
+                    out = seg_dir / f"{prefix}_{time_key}_noface.mp4"
+                    _audio_only_clip(raw_clip, audio_slice, out, actual_dur)
+                    scene["lip_sync"] = "skipped_no_face_lock"
+                    output_clips.append(out)
+                    continue
+                try:
+                    boxes, presence = locked_boxes_for_clip(raw_clip, face_engine, lock)
+                except PipelineError as e:
+                    print(f"  [LipSync] A-Roll → face check failed ({e}); dubbing audio only")
+                    out = seg_dir / f"{prefix}_{time_key}_facecheckfail.mp4"
+                    _audio_only_clip(raw_clip, audio_slice, out, actual_dur)
+                    scene["lip_sync"] = "skipped_face_check_failed"
+                    output_clips.append(out)
+                    continue
+                scene["locked_face_ratio"] = round(presence, 3)
+                if presence < LOCK_MIN_PRESENCE or not any(box is not None for box in boxes):
+                    print(f"  [LipSync] A-Roll → locked face present in {presence:.0%} of frames "
+                          f"(< {LOCK_MIN_PRESENCE:.0%}); dubbing audio only")
+                    out = seg_dir / f"{prefix}_{time_key}_notarget.mp4"
+                    _audio_only_clip(raw_clip, audio_slice, out, actual_dur)
+                    scene["lip_sync"] = "skipped_not_target"
+                    output_clips.append(out)
+                    continue
+                options = {
+                    "sync_mode": "cut_off",
+                    "active_speaker_detection": build_sync_options(boxes),
+                }
 
             # --- Submit to Sync Labs ---
             print(f"  [LipSync] A-Roll → uploading to Sync Labs {sync_model} "
@@ -202,11 +260,6 @@ def process_shots(
                 video_url = sync_client.upload_file(raw_clip, content_type="video/mp4")
                 audio_url = sync_client.upload_file(audio_slice, content_type="audio/wav")
 
-                options = {
-                    "sync_mode": "cut_off",
-                    "active_speaker_detection": {"auto_detect": True},
-                }
-
                 gen_data = sync_client.generate(video_url, audio_url,
                                                 model=sync_model, options=options)
                 gen_id = gen_data["id"]
@@ -214,6 +267,7 @@ def process_shots(
                 result = sync_client.wait_for_completion(gen_id, poll_interval=8)
                 sync_client.download_result(result["outputUrl"], synced_out)
                 print(f"  [LipSync] Downloaded → {synced_out.name}")
+                scene["lip_sync"] = "synced"
                 output_clips.append(synced_out)
 
             except PipelineError as e:
@@ -221,10 +275,8 @@ def process_shots(
                 print(f"  [LipSync] ⚠ Sync Labs failed for shot {i}: {e}")
                 print(f"  [LipSync] Falling back to B-Roll mux (original video + dubbed audio)")
                 fallback_out = seg_dir / f"{prefix}_{time_key}_syncfail_fallback.mp4"
-                if not fallback_out.exists():
-                    _mux_audio_onto_video(raw_clip, audio_slice, fallback_out, actual_dur)
+                _audio_only_clip(raw_clip, audio_slice, fallback_out, actual_dur)
+                scene["lip_sync"] = "sync_failed"
                 output_clips.append(fallback_out)
 
     return output_clips
-
-
