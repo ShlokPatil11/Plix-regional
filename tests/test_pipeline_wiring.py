@@ -84,3 +84,34 @@ def test_assembler_mixes_music_at_the_requested_percent(tmp_path):
     plain = assembler.assemble(voice, None, srt, job_id="j")
     mixed = assembler.assemble(voice, None, srt, job_id="j", music=music, music_percent=80)
     assert mean_volume_db(mixed.metadata["path"]) > mean_volume_db(plain.metadata["path"]) + 1.0
+
+
+class NoMusicAudio:
+    def __init__(self, backend, tmp_path):
+        self.backend, self.tmp_path = backend, tmp_path
+
+    def run(self, video, **kwargs):
+        voice = make_video(self.tmp_path / "voice.mp4", seconds=2.0)
+        return {"video": artifact(self.backend, voice, "service-b-video.mp4", "video/mp4")}
+
+
+class StrictAssembler:
+    """Host assembler written against the original signature (no music kwargs)."""
+
+    def __init__(self, inner):
+        self.inner, self.called = inner, False
+
+    def assemble(self, video, audio, visual_subtitles, *, job_id):
+        self.called = True
+        return self.inner.assemble(video, audio, visual_subtitles, job_id=job_id)
+
+
+def test_strict_signature_assembler_still_works_when_there_is_no_music(tmp_path):
+    backend = FileArtifactBackend(tmp_path / "art")
+    source = artifact(backend, make_video(tmp_path / "in.mp4"), "in.mp4", "video/mp4")
+    assembler = StrictAssembler(FfmpegFinalAssembler(backend))
+    pipeline = DirectoryLanguagePipeline(services(backend, NoMusicAudio(backend, tmp_path), assembler))
+    result = pipeline.run(source, target_language="hi", job_id="job1")
+    assert assembler.called
+    assert result.music_track is None
+    assert result.manifest["music_track"] is None

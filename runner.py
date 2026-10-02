@@ -105,13 +105,15 @@ class DirectoryLanguagePipeline:
             if on_stage:
                 on_stage("finalizing")
             assembly_video = dubbed_video or service_a_video
+            # Only pass the music kwargs when there is music, so host assemblers
+            # written against the original signature keep working.
+            extra = {"music": music_track, "music_percent": DEFAULT_MUSIC_PERCENT} if music_track else {}
             final_video = self.services.assembler.assemble(
                 assembly_video,
                 None if dubbed_video else dubbed_audio,
                 visual_srt,
                 job_id=job_id,
-                music=music_track,
-                music_percent=DEFAULT_MUSIC_PERCENT,
+                **extra,
             )
             final_video = self.services.publisher.publish(
                 final_video, name="final_video.mp4", job_id=job_id
