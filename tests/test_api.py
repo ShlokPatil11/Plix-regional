@@ -1,5 +1,6 @@
 import importlib
 import json
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -72,8 +73,38 @@ def test_confirm_rejects_unknown_candidate_unknown_job_and_not_waiting(api, tmp_
     publish_faces(art)
     assert client.post("/api/jobs/j1/face", json={"candidate_id": "9"}).status_code == 422
     assert client.post("/api/jobs/nope/face", json={"candidate_id": "0"}).status_code == 404
-    new_job(module, tmp_path, job_id="j2")  # queued, not waiting
+    new_job(module, tmp_path, job_id="j2")  # queued, not waiting, and no choices published
     assert client.post("/api/jobs/j2/face", json={"candidate_id": "0"}).status_code == 409
+
+
+def test_confirm_rejects_a_queued_job_even_when_choices_are_published(api, tmp_path):
+    module, client = api
+    art = new_job(module, tmp_path, job_id="j2")  # still queued, never paused
+    publish_faces(art)
+    assert module.store.get("j2")["status"] == "queued"
+    assert client.post("/api/jobs/j2/face", json={"candidate_id": "0"}).status_code == 409
+    assert module.store.get("j2")["face_choice"] is None
+
+
+def test_confirm_rejects_a_different_choice_after_confirmation_but_accepts_the_same(api, tmp_path):
+    module, client = api
+    art = new_job(module, tmp_path, status="awaiting")
+    publish_faces(art)
+    first = client.post("/api/jobs/j1/face", json={"candidate_id": "1"})
+    assert first.status_code == 200 and first.json()["status"] == "queued"
+    assert client.post("/api/jobs/j1/face", json={"candidate_id": "0"}).status_code == 409
+    assert client.post("/api/jobs/j1/face", json={"candidate_id": "1"}).status_code == 200
+    assert module.store.get("j1")["face_choice"] == "1"
+
+
+def test_confirm_rejects_an_expired_job(api, tmp_path):
+    module, client = api
+    art = new_job(module, tmp_path, status="awaiting")
+    publish_faces(art)
+    time.sleep(0.05)
+    assert module.store.expire_stale(max_age_seconds=0) == ["j1"]
+    assert module.store.get("j1")["status"] == "failed"
+    assert client.post("/api/jobs/j1/face", json={"candidate_id": "0"}).status_code == 409
 
 
 def completed_job(module, tmp_path, with_music=True):
