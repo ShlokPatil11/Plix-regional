@@ -64,6 +64,8 @@ Dubbing and Combine pause for face confirmation. The UI shows the faces that app
 
 The ad's background music is identified with Shazam (`shazamio`, no API key), downloaded from YouTube with `yt-dlp`, aligned to the video, and mixed with the dubbed voice. Use the **Music level** slider on the result page (or `POST /api/jobs/{job_id}/remix` with `{"music_percent": 0-100}`) to change the mix; the default level is 25%, and changing it runs only ffmpeg. If the music is not identified or cannot be downloaded the video is voice-only and the slider is disabled. `music.json` records the artist, title, and YouTube URL used.
 
+**Custom music.** On a finished job, open **Use custom music instead** under the video to replace the detected track (or to add one when nothing was detected). Upload an MP3, WAV, M4A, AAC, OGG or FLAC file (up to 50 MB), or paste a single YouTube link (up to 15 minutes; playlists and other sites are rejected). The API is `POST /api/jobs/{job_id}/music` (multipart form: `file` or `url`, plus an optional `music_percent`). The custom track starts at 0:00 and is trimmed to the video length; it replaces the detected one, and the level slider and `/remix` then work on it as usual. `music.json` records `source: "custom"` and, for a YouTube link, its URL.
+
 The job status response now includes a `music` field. Downloading commercial tracks from YouTube is a licensing and terms-of-service decision for ads that will run; review it before shipping.
 
 ## Process logs and failures

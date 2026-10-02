@@ -27,6 +27,8 @@
     .face img { width: 140px; height: 140px; object-fit: cover; border-radius: 6px; display: block; }
     .music-panel { margin: 12px 0; }
     .music-panel input[type=range] { width: 260px; vertical-align: middle; }
+.custom-music { margin-top: 10px; }
+.custom-music input, .custom-music small { display: block; margin: 6px 0; }
   </style>
 </head>
 <body>
@@ -100,35 +102,75 @@ async function renderFacePanel(jobId, resume) {
   result.append(panel);
 }
 
+function errorText(body, fallback) {
+  return body && typeof body.detail === 'string' ? body.detail : fallback;
+}
+
 function renderMusicPanel(jobId, job, video) {
-  const music = job.music;
-  if (!music) return;
+  if (!job.music) return;
   const panel = document.createElement('div'); panel.className = 'music-panel';
-  if (music.status !== 'ok') {
-    panel.textContent = music.status === 'download_failed'
-      ? `Music identified (${music.artist} – ${music.title}) but could not be downloaded — voice-only video.`
-      : 'Music not identified — voice-only video.';
-    result.append(panel); return;
-  }
-  const label = document.createElement('p'); label.textContent = `Music: ${music.artist} – ${music.title}`;
-  const slider = document.createElement('input'); slider.type = 'range'; slider.min = 0; slider.max = 100;
-  slider.value = music.percent ?? 25;
-  const value = document.createElement('output'); value.textContent = `${slider.value}%`;
-  slider.addEventListener('input', () => { value.textContent = `${slider.value}%`; });
-  const apply = document.createElement('button'); apply.type = 'button'; apply.textContent = 'Apply';
-  const status = document.createElement('small');
-  apply.addEventListener('click', async () => {
-    apply.disabled = true; status.textContent = 'Mixing…';
-    try {
-      const reply = await fetch(`/api/jobs/${jobId}/remix`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({music_percent: Number(slider.value)})});
-      const body = await reply.json().catch(() => ({}));
-      if (reply.ok) { video.src = `${body.final_video}?v=${Date.now()}`; video.load(); status.textContent = `Applied ${body.music_percent}%`; }
-      else status.textContent = body.detail || 'Mix failed';
-    } catch (error) { status.textContent = `Mix failed: ${error.message}`; }
-    apply.disabled = false;
-  });
-  panel.append(label, slider, value, apply, status);
   result.append(panel);
+  const draw = music => {
+    panel.replaceChildren();
+    let slider = null;
+    if (music.status === 'ok') {
+      const label = document.createElement('p'); label.textContent = `Music: ${music.artist} – ${music.title}`;
+      slider = document.createElement('input'); slider.type = 'range'; slider.min = 0; slider.max = 100;
+      slider.value = music.percent ?? 25;
+      const value = document.createElement('output'); value.textContent = `${slider.value}%`;
+      slider.addEventListener('input', () => { value.textContent = `${slider.value}%`; });
+      const apply = document.createElement('button'); apply.type = 'button'; apply.textContent = 'Apply';
+      const status = document.createElement('small');
+      apply.addEventListener('click', async () => {
+        apply.disabled = true; status.textContent = 'Mixing…';
+        try {
+          const reply = await fetch(`/api/jobs/${jobId}/remix`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({music_percent: Number(slider.value)})});
+          const body = await reply.json().catch(() => ({}));
+          if (reply.ok) { video.src = `${body.final_video}?v=${Date.now()}`; video.load(); status.textContent = `Applied ${body.music_percent}%`; }
+          else status.textContent = errorText(body, 'Mix failed');
+        } catch (error) { status.textContent = `Mix failed: ${error.message}`; }
+        apply.disabled = false;
+      });
+      panel.append(label, slider, value, apply, status);
+    } else {
+      const note = document.createElement('p');
+      note.textContent = music.status === 'download_failed'
+        ? `Music identified (${music.artist} – ${music.title}) but could not be downloaded — voice-only video.`
+        : 'Music not identified — voice-only video.';
+      panel.append(note);
+    }
+    panel.append(customMusicSection(jobId, music, video, () => slider ? Number(slider.value) : (music.percent ?? 25), draw));
+  };
+  draw(job.music);
+}
+
+function customMusicSection(jobId, music, video, currentPercent, redraw) {
+  const section = document.createElement('details'); section.className = 'custom-music';
+  const summary = document.createElement('summary'); summary.textContent = 'Use custom music instead';
+  const fileInput = document.createElement('input'); fileInput.type = 'file';
+  fileInput.accept = 'audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac';
+  const urlInput = document.createElement('input'); urlInput.type = 'url'; urlInput.placeholder = '…or paste a YouTube link';
+  const useButton = document.createElement('button'); useButton.type = 'button'; useButton.textContent = 'Use custom music';
+  const status = document.createElement('small');
+  useButton.addEventListener('click', async () => {
+    const file = fileInput.files[0]; const link = urlInput.value.trim();
+    if (Boolean(file) === Boolean(link)) { status.textContent = 'Choose an audio file or paste a YouTube link (one of the two).'; return; }
+    const form = new FormData();
+    if (file) form.append('file', file); else form.append('url', link);
+    form.append('music_percent', String(currentPercent()));
+    useButton.disabled = true; status.textContent = file ? 'Uploading and mixing…' : 'Downloading and mixing…';
+    try {
+      const reply = await fetch(`/api/jobs/${jobId}/music`, {method: 'POST', body: form});
+      const body = await reply.json().catch(() => ({}));
+      if (reply.ok) { video.src = `${body.final_video}?v=${Date.now()}`; video.load(); redraw(body.music); return; }
+      status.textContent = errorText(body, 'Could not use that music');
+    } catch (error) { status.textContent = `Could not use that music: ${error.message}`; }
+    useButton.disabled = false;
+  });
+  const hint = document.createElement('small');
+  hint.textContent = 'MP3, WAV, M4A, AAC, OGG or FLAC up to 50 MB, or a YouTube video up to 15 minutes. The music starts at 0:00 and is trimmed to the video length.';
+  section.append(summary, fileInput, urlInput, useButton, hint, status);
+  return section;
 }
 
 function startPolling(jobId) {

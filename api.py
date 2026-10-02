@@ -8,6 +8,7 @@ import mimetypes
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -22,7 +23,8 @@ from .contracts import AwaitingFaceSelection, PipelineStageError
 from .in_process import run_operation
 from .job_store import JobStore
 from .media import FileArtifactBackend
-from .mixer import MixError, mix_final
+from .mixer import DEFAULT_MUSIC_PERCENT, MixError, mix_final
+from .music import MusicFetchError, YouTubeFetcher, media_duration, prepare_custom_track
 from .service_adapters import LANGUAGES
 
 
@@ -35,6 +37,13 @@ stop_worker = threading.Event()
 worker_thread: threading.Thread | None = None
 CROP_NAME = re.compile(r"^face_cand_\d+\.jpg$")
 remix_lock = threading.Lock()
+ALLOWED_MUSIC_SUFFIXES = frozenset({".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"})
+MAX_MUSIC_UPLOAD_BYTES = 50 * 1024 * 1024
+MIN_VOICE_SECONDS = 0.5
+
+
+def make_youtube_fetcher() -> YouTubeFetcher:
+    return YouTubeFetcher()
 
 
 class FaceChoice(BaseModel):
@@ -380,3 +389,76 @@ def remix(job_id: str, body: RemixRequest):
     except MixError as exc:
         raise HTTPException(500, str(exc)) from exc
     return {"music_percent": body.music_percent, "final_video": f"/api/jobs/{job_id}/artifacts/final_video"}
+
+
+@app.post("/api/jobs/{job_id}/music")
+def set_custom_music(
+    job_id: str,
+    file: UploadFile | None = File(None),
+    url: str | None = Form(None),
+    music_percent: int | None = Form(None, ge=0, le=100),
+):
+    """Replace the job's music with an uploaded audio file or a single YouTube link, then re-mix."""
+    record = store.get(job_id)
+    if record is None:
+        raise HTTPException(404, "Job not found")
+    url = (url or "").strip() or None
+    has_file = file is not None and bool(file.filename)
+    if has_file == (url is not None):
+        raise HTTPException(422, "Send either an audio file or a YouTube link, not both and not neither.")
+    if record["status"] != "completed":
+        raise HTTPException(409, "The job has not completed yet")
+    art = _artifacts_dir(job_id)
+    voice = art / "voice_video.mp4"
+    final_path = record["artifacts"].get("final_video")
+    if not voice.is_file() or not final_path:
+        raise HTTPException(409, "This job has no voice-only video to add music to")
+    duration = media_duration(voice)
+    if duration < MIN_VOICE_SECONDS:
+        raise HTTPException(409, "This job's voice-only video could not be read")
+
+    scratch = art / f".custom_{uuid4().hex}"
+    scratch.mkdir()
+    try:
+        if has_file:
+            safe_name = Path(file.filename).name
+            suffix = Path(safe_name).suffix.lower()
+            if suffix not in ALLOWED_MUSIC_SUFFIXES:
+                raise HTTPException(415, "Upload an MP3, WAV, M4A, AAC, OGG or FLAC audio file.")
+            source = scratch / f"upload{suffix}"
+            written = 0
+            with source.open("wb") as output:
+                while chunk := file.file.read(1024 * 1024):
+                    written += len(chunk)
+                    if written > MAX_MUSIC_UPLOAD_BYTES:
+                        raise HTTPException(413, f"Audio file is larger than {MAX_MUSIC_UPLOAD_BYTES // (1024 * 1024)} MB.")
+                    output.write(chunk)
+            title, source_url = safe_name[:80], None
+        else:
+            fetched = make_youtube_fetcher().fetch_url(url, scratch)
+            source, title, source_url = fetched.path, (fetched.title or "YouTube audio")[:80], fetched.url
+        new_track = scratch / "music_track.mp3"
+        prepare_custom_track(source, duration, new_track)
+
+        previous = _read_json(art / "music.json") or {}
+        percent = music_percent if music_percent is not None else previous.get("percent", DEFAULT_MUSIC_PERCENT)
+        info = {"status": "ok", "source": "custom", "title": title, "artist": "Custom",
+                "source_url": source_url, "percent": percent}
+        subtitles = art / "visual_subtitles.srt"
+        with remix_lock:
+            mix_final(voice, new_track, percent, Path(final_path),
+                      subtitles=subtitles if subtitles.is_file() else None)
+            os.replace(new_track, art / "music_track.mp3")
+            info_tmp = art / ".music.json.tmp"
+            info_tmp.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(info_tmp, art / "music.json")
+        store.set_artifact(job_id, "music_track", str(art / "music_track.mp3"))
+        store.set_artifact(job_id, "music_info", str(art / "music.json"))
+    except MusicFetchError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except MixError as exc:
+        print(f"[job {job_id}] custom music mix failed: {exc}", file=sys.__stderr__ or sys.stderr, flush=True)
+        raise HTTPException(500, "Could not mix that music into the video.") from exc
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    return {"music_percent": percent, "final_video": f"/api/jobs/{job_id}/artifacts/final_video", "music": info}

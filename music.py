@@ -7,6 +7,7 @@ import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Protocol
+from urllib.parse import urlparse
 
 
 class MusicFetchError(RuntimeError):
@@ -26,6 +27,7 @@ class MusicMatch:
 class FetchedTrack:
     path: Path
     url: str
+    title: str = ""
 
 
 @dataclass
@@ -166,6 +168,20 @@ class ShazamIdentifier:
         return parse_shazam_result(asyncio.run(self._recognize(Path(clip))))
 
 
+YOUTUBE_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"})
+MAX_CUSTOM_VIDEO_SECONDS = 15 * 60
+YOUTUBE_SOCKET_TIMEOUT_S = 20
+
+
+def is_youtube_url(url: str) -> bool:
+    """Only plain YouTube links: yt-dlp supports many other sites we do not want to expose."""
+    try:
+        parsed = urlparse((url or "").strip())
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and (parsed.hostname or "").lower() in YOUTUBE_HOSTS
+
+
 class YouTubeFetcher:
     def __init__(
         self,
@@ -211,6 +227,45 @@ class YouTubeFetcher:
             raise MusicFetchError("yt-dlp did not produce an MP3 file.")
         return FetchedTrack(path=target, url=url)
 
+    def fetch_url(self, url: str, dest_dir: Path, max_duration_s: float = MAX_CUSTOM_VIDEO_SECONDS) -> FetchedTrack:
+        """Download the audio of ONE YouTube video the user pasted (custom music)."""
+        url = url.strip()
+        if not is_youtube_url(url):
+            raise MusicFetchError("Only youtube.com and youtu.be links are supported.")
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        common = {"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": YOUTUBE_SOCKET_TIMEOUT_S}
+        try:
+            with self._ydl({**common, "skip_download": True}) as ydl:
+                info = ydl.extract_info(url, download=False) or {}
+            if info.get("_type") == "playlist" or info.get("entries"):
+                raise MusicFetchError("Paste a link to a single video, not a playlist.")
+            duration = info.get("duration")
+            if not duration or duration > max_duration_s:
+                raise MusicFetchError(
+                    f"The video must be {int(max_duration_s // 60)} minutes or shorter (live streams are not supported)."
+                )
+            target = dest_dir / "custom_source.mp3"
+            target.unlink(missing_ok=True)
+            download = {
+                **common,
+                "format": "bestaudio/best",
+                "outtmpl": str(dest_dir / "custom_source.%(ext)s"),
+                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+            }
+            if self.ffmpeg_location:
+                download["ffmpeg_location"] = self.ffmpeg_location
+            with self._ydl(download) as ydl:
+                ydl.download([url])
+        except MusicFetchError:
+            raise
+        except Exception as exc:
+            print(f"[Music] custom YouTube fetch failed for {url}: {exc}")
+            raise MusicFetchError("Could not download that video's audio. Check the link and try again.") from exc
+        if not target.is_file():
+            raise MusicFetchError("Could not download that video's audio. Check the link and try again.")
+        return FetchedTrack(path=target, url=url, title=str(info.get("title") or "YouTube audio"))
+
 
 def _run_ffmpeg(command: list[str]) -> None:
     completed = subprocess.run(command, capture_output=True, text=True)
@@ -251,6 +306,33 @@ def _audio_duration(ffmpeg_binary: str, path: Path) -> float:
         return 0.0
     hours, minutes, seconds = times[-1]
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def media_duration(path: Path, ffmpeg_binary: str = "ffmpeg") -> float:
+    """Duration in seconds of an audio or video file; 0.0 when unreadable."""
+    return _audio_duration(ffmpeg_binary, Path(path))
+
+
+def prepare_custom_track(source: Path, duration_s: float, output: Path, *, ffmpeg_binary: str = "ffmpeg") -> None:
+    """Turn a user-supplied audio (or video) file into the aligned music track.
+
+    The track starts at 0:00 (no Shazam offset applies), is trimmed to the video
+    length and fades out. Raises MusicFetchError, with a message safe to show the
+    user, when the file has no usable audio.
+    """
+    output = Path(output)
+    temporary = output.with_name(f".{output.stem}.custom.tmp{output.suffix}")
+    try:
+        try:
+            _run_ffmpeg(build_align_command(ffmpeg_binary, Path(source), 0.0, duration_s, temporary))
+        except MusicFetchError as exc:
+            print(f"[Music] custom track could not be decoded: {exc}")
+            raise MusicFetchError("That file does not contain audio that can be read.") from exc
+        if _audio_duration(ffmpeg_binary, temporary) < MIN_ALIGNED_SECONDS:
+            raise MusicFetchError("That file does not contain audio that can be read.")
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _cut_window(ffmpeg_binary: str, source: Path, start: float, end: float, output: Path) -> None:

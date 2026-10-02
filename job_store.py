@@ -97,6 +97,20 @@ class JobStore:
             )
         self._write_manifest(job_id)
 
+    def set_artifact(self, job_id: str, name: str, path: str) -> None:
+        """Register (or replace) one artifact of an existing job without changing its state."""
+        with self._lock, self._connect() as db:
+            row = db.execute("SELECT artifacts FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                return
+            artifacts = json.loads(row["artifacts"])
+            artifacts[name] = str(path)
+            db.execute(
+                "UPDATE jobs SET artifacts=?,updated_at=? WHERE job_id=?",
+                (json.dumps(artifacts), self._now(), job_id),
+            )
+        self._write_manifest(job_id)
+
     def fail(self, job_id: str, stage: str, error: str) -> None:
         with self._lock, self._connect() as db:
             db.execute(
