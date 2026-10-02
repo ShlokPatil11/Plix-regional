@@ -38,6 +38,7 @@ def run_dubbing_engine(
     num_speakers: int = 0,
     dry_run: bool = False,
     skip_stages: list[int] = None,
+    face_lock=None,
 ) -> Path:
     """
     Full 5-stage dubbing pipeline.
@@ -56,6 +57,8 @@ def run_dubbing_engine(
         num_speakers        : Expected speaker count (0 = auto-detect)
         dry_run             : Simulate pipeline without paid API calls
         skip_stages         : List of stage numbers to skip (e.g. [3] reuses existing dub)
+        face_lock           : FaceLock choosing which face to lip-sync (None = legacy auto-detect;
+                              a disabled lock dubs audio-only)
 
     Returns:
         Path to final assembled video
@@ -199,6 +202,11 @@ def run_dubbing_engine(
             job_dir=job_dir,
             sync_model=sync_model,
             dry_run=dry_run,
+            lock=face_lock,
+        )
+        # Persist per-shot lip-sync decisions (lip_sync, locked_face_ratio) for review.
+        (job_dir / "scenes.json").write_text(
+            json.dumps(classified_scenes, ensure_ascii=False, indent=2), encoding="utf-8"
         )
     else:
         # Reconstruct clip list from existing segments

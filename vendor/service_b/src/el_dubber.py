@@ -215,6 +215,9 @@ class ElevenLabsDubber:
             "source_lang": source_lang or "auto",
             "num_speakers": str(int(num_speakers)),
             "watermark": "false",
+            # Voice only: the original music is restored later from the identified
+            # track, so the dub must not carry its own background audio.
+            "drop_background_audio": "true",
         }
         print(f"[Dubber] Submitting to ElevenLabs Dubbing ({source_lang} → {target_lang})...")
         with open(video_path, "rb") as f:
