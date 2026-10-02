@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+AWAITING = "awaiting_face_selection"
 
 
 class JobStore:
@@ -25,6 +27,8 @@ class JobStore:
                 input_path TEXT NOT NULL,
                 input_name TEXT NOT NULL,
                 artifacts TEXT NOT NULL DEFAULT '{}',
+                face_choice TEXT,
+                awaiting_since TEXT,
                 error TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -32,6 +36,10 @@ class JobStore:
             columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
             if "operation" not in columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN operation TEXT NOT NULL DEFAULT 'combine'")
+            if "face_choice" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN face_choice TEXT")
+            if "awaiting_since" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN awaiting_since TEXT")
             # A worker process may have stopped while a job was active. Keep its
             # uploaded source and retry it from the beginning after restart.
             db.execute(
@@ -96,6 +104,53 @@ class JobStore:
                 (stage, error, self._now(), job_id),
             )
         self._write_manifest(job_id)
+
+    def await_face(self, job_id: str) -> None:
+        with self._lock, self._connect() as db:
+            db.execute(
+                "UPDATE jobs SET status=?,stage=?,awaiting_since=?,updated_at=? WHERE job_id=?",
+                (AWAITING, AWAITING, self._now(), self._now(), job_id),
+            )
+        self._write_manifest(job_id)
+
+    def confirm_face(self, job_id: str, candidate_id: str) -> str:
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status, face_choice FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                db.commit()
+                return "unknown_job"
+            if row["status"] == AWAITING:
+                db.execute(
+                    "UPDATE jobs SET status='queued',stage='queued',face_choice=?,awaiting_since=NULL,updated_at=? WHERE job_id=?",
+                    (candidate_id, self._now(), job_id),
+                )
+                db.commit()
+                outcome = "queued"
+            elif row["face_choice"] == candidate_id and row["status"] in ("queued", "running", "completed"):
+                db.commit()
+                return "already_confirmed"
+            else:
+                db.commit()
+                return "not_awaiting"
+        self._write_manifest(job_id)
+        return outcome
+
+    def expire_stale(self, max_age_seconds: float = 24 * 3600) -> list[str]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)).isoformat()
+        with self._lock, self._connect() as db:
+            rows = db.execute(
+                "SELECT job_id FROM jobs WHERE status=? AND awaiting_since <= ?", (AWAITING, cutoff)
+            ).fetchall()
+            expired = [row["job_id"] for row in rows]
+            for job_id in expired:
+                db.execute(
+                    "UPDATE jobs SET status='failed',stage='expired',error=?,updated_at=? WHERE job_id=?",
+                    ("Face confirmation timed out after 24 hours; submit the video again.", self._now(), job_id),
+                )
+        for job_id in expired:
+            self._write_manifest(job_id)
+        return expired
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         with self._lock, self._connect() as db:
