@@ -5,8 +5,10 @@ This is the deployable web application that embeds the processing code and requi
 ```text
 video upload
   -> Service A: translated on-screen video + visual SRT
-  -> Service B: spoken-audio transcript/SRT + dubbed/lip-synced video
-  -> final mux: Service B video/audio + Service A visual SRT track
+  -> analyze: transcript, shot cuts, face candidates, background music (Shazam -> YouTube -> MP3)
+  -> pause: user confirms which face to lip-sync (status awaiting_face_selection)
+  -> Service B: voice-only dub, lip-sync on shots with the locked face only
+  -> final mix: voice + music x slider% + Service A visual SRT track
   -> final MP4 + separate Service A and Service B SRT downloads
 ```
 
@@ -37,6 +39,20 @@ docker build -t directory-language-studio .
 docker run --env-file .env -p 8000:8000 -v directory-language-data:/data directory-language-studio
 ```
 
+## Face lock and background music
+
+Dubbing and Combine now pause after analysis. The job page shows the faces that appear while someone speaks; confirm the speaker and the job resumes (`POST /api/jobs/{job_id}/face` with `{"candidate_id": "0"}`). Only shots where that person is visible are lip-synced; Sync Labs receives per-frame bounding boxes of the locked face. If no face is found the video is dubbed audio-only. Jobs waiting for confirmation expire after 24 hours.
+
+The ad's background music is identified with Shazam (`shazamio`, no API key), downloaded from YouTube with `yt-dlp`, aligned to the video, and mixed with the dubbed voice. Use the **Music level** slider on the result page (or `POST /api/jobs/{job_id}/remix` with `{"music_percent": 0-100}`) to change the mix; this runs only ffmpeg. If the music is not identified or cannot be downloaded the video is voice-only and the slider is disabled. `music.json` records the artist, title, and YouTube URL used.
+
+Downloading commercial tracks from YouTube is a licensing and terms-of-service decision for ads that will run; review it before shipping.
+
+To run the tests, use:
+
+```sh
+.venv/bin/python -m pytest tests -q
+```
+
 Configure the required secrets in `.env`:
 
 - `GEMINI_API_KEY` for Service A visual translation (default model: `gemini-3.6-flash`). Create the key in Google AI Studio and set it as a deployment secret. Set `TRANSLATION_PROVIDER=claude` plus `ANTHROPIC_API_KEY` and `TRANSLATION_MODEL` only if you want Claude instead.
@@ -57,6 +73,9 @@ On a fresh deployment, Service B downloads its faster-whisper model at runtime. 
 - `final_video`: final MP4, with Service A visual subtitles burned in and also attached as a selectable subtitle track.
 - `visual_subtitles`: the translated visual SRT from Service A.
 - `audio_subtitles`: the independent transcript/dub SRT from Service B.
+- `voice_video`: voice-only video before the music mix.
+- `music_track`: aligned MP3.
+- `music_info`: `music.json`.
 - `service_a_video`, `service_b_video`, and `service_b_audio`: retained stage outputs for inspection.
 
 The orchestrator stores stage status and artifact URLs in SQLite and each job's `manifest.json`. The host filesystem paths stay internal to the container. If the app restarts during a running job, it queues that job again from the uploaded source.
