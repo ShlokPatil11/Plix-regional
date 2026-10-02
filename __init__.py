@@ -1,11 +1,12 @@
 """Hosted orchestration for the visual-subtitle and audio-dubbing services."""
 
-from .contracts import Artifact, PipelineResult, PipelineStageError
+from .contracts import Artifact, AwaitingFaceSelection, PipelineResult, PipelineStageError
 from .runner import DirectoryLanguagePipeline, PipelineServices
 from .in_process import run_artifact
 
 __all__ = [
     "Artifact",
+    "AwaitingFaceSelection",
     "DirectoryLanguagePipeline",
     "PipelineResult",
     "PipelineServices",

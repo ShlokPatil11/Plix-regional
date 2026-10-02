@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .contracts import Artifact
+from .mixer import DEFAULT_MUSIC_PERCENT, mix_final
 
 
 class ArtifactBackend(Protocol):
@@ -85,33 +86,32 @@ class FfmpegFinalAssembler:
         visual_subtitles: Artifact,
         *,
         job_id: str,
+        music: Artifact | None = None,
+        music_percent: int = DEFAULT_MUSIC_PERCENT,
     ) -> Artifact:
         with tempfile.TemporaryDirectory(prefix=f"dir-language-{job_id}-") as temp:
             root = Path(temp)
             video_path = self.backend.download(video, root / "service-a-video.mp4")
             subtitle_path = self.backend.download(visual_subtitles, root / "visual.srt")
-            audio_path = self.backend.download(audio, root / audio.filename) if audio else None
-            output = root / "final_video.mp4"
 
-            command = [self.ffmpeg_binary, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(video_path)]
-            if audio_path:
-                command += ["-i", str(audio_path)]
-            command += ["-i", str(subtitle_path), "-map", "0:v:0"]
-            if audio_path:
-                command += ["-map", "1:a:0"]
-            else:
-                command += ["-map", "0:a:0?"]
-            subtitle_input = 2 if audio_path else 1
-            command += [
-                "-map", f"{subtitle_input}:0",
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-c:s", "mov_text",
-                "-metadata:s:s:0", "language=und",
-                "-metadata:s:s:0", "title=Visual subtitles (Service A)",
-                "-movflags", "+faststart",
-                str(output),
-            ]
+            if audio is None:
+                music_path = self.backend.download(music, root / "music.mp3") if music else None
+                mixed = mix_final(
+                    video_path, music_path, music_percent, root / "final_video.mp4",
+                    subtitles=subtitle_path, ffmpeg_binary=self.ffmpeg_binary,
+                )
+                return self.backend.upload(mixed, filename="final_video.mp4", content_type="video/mp4")
+
+            # Legacy path: Service B returned audio separately from the video.
+            audio_path = self.backend.download(audio, root / audio.filename)
+            output = root / "final_video.mp4"
+            command = [self.ffmpeg_binary, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                       "-i", str(video_path), "-i", str(audio_path), "-i", str(subtitle_path),
+                       "-map", "0:v:0", "-map", "1:a:0", "-map", "2:0",
+                       "-c:v", "copy", "-c:a", "aac", "-c:s", "mov_text",
+                       "-metadata:s:s:0", "language=und",
+                       "-metadata:s:s:0", "title=Visual subtitles (Service A)",
+                       "-movflags", "+faststart", str(output)]
             completed = subprocess.run(command, capture_output=True, text=True)
             if completed.returncode:
                 raise RuntimeError(f"Final video mux failed: {completed.stderr.strip()}")

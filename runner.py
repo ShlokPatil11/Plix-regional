@@ -5,7 +5,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
-from .contracts import Artifact, PipelineResult, PipelineStageError
+from .contracts import Artifact, AwaitingFaceSelection, PipelineResult, PipelineStageError
+from .mixer import DEFAULT_MUSIC_PERCENT
 
 
 class VisualSubtitleService(Protocol):
@@ -28,6 +29,8 @@ class FinalVideoAssembler(Protocol):
         visual_subtitles: Artifact,
         *,
         job_id: str,
+        music: Artifact | None = None,
+        music_percent: int = DEFAULT_MUSIC_PERCENT,
     ) -> Artifact: ...
 
 
@@ -89,10 +92,12 @@ class DirectoryLanguagePipeline:
             dubbed_video = audio.get("video")
             dubbed_audio = audio.get("audio")
             audio_srt = audio.get("audio_subtitles")
+            music_track = audio.get("music_track")
+            music_info = audio.get("music_info")
             if on_stage:
                 on_stage("service_b_completed")
         except Exception as exc:
-            if isinstance(exc, PipelineStageError):
+            if isinstance(exc, (PipelineStageError, AwaitingFaceSelection)):
                 raise
             raise PipelineStageError("service_b", "audio dubbing failed", cause=exc) from exc
 
@@ -105,6 +110,8 @@ class DirectoryLanguagePipeline:
                 None if dubbed_video else dubbed_audio,
                 visual_srt,
                 job_id=job_id,
+                music=music_track,
+                music_percent=DEFAULT_MUSIC_PERCENT,
             )
             final_video = self.services.publisher.publish(
                 final_video, name="final_video.mp4", job_id=job_id
@@ -131,6 +138,7 @@ class DirectoryLanguagePipeline:
             "service_a_video": service_a_video.uri,
             "service_b_video": dubbed_video.uri if dubbed_video else None,
             "service_b_audio": dubbed_audio.uri if dubbed_audio else None,
+            "music_track": music_track.uri if music_track else None,
             "final_video": final_video.uri,
         }
         return PipelineResult(
@@ -143,6 +151,8 @@ class DirectoryLanguagePipeline:
             service_b_video=dubbed_video,
             service_b_audio=dubbed_audio,
             manifest=manifest,
+            music_track=music_track,
+            music_info=music_info,
         )
 
     @staticmethod

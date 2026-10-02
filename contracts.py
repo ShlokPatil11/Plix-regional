@@ -26,6 +26,10 @@ class PipelineStageError(RuntimeError):
         self.cause = cause
 
 
+class AwaitingFaceSelection(RuntimeError):
+    """Analysis finished; the user must confirm which face to lip-sync before rendering."""
+
+
 @dataclass(frozen=True)
 class PipelineResult:
     job_id: str
@@ -37,3 +41,5 @@ class PipelineResult:
     service_b_video: Artifact | None
     service_b_audio: Artifact | None
     manifest: Mapping[str, Any]
+    music_track: Artifact | None = None
+    music_info: Artifact | None = None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 import os
 import shutil
 import sys
@@ -10,8 +11,9 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .contracts import Artifact
+from .contracts import Artifact, AwaitingFaceSelection
 from .media import ArtifactBackend
+from .music import ShazamIdentifier, YouTubeFetcher, identify_and_fetch
 
 
 SERVICE_A_ROOT = Path(__file__).resolve().parent / "vendor" / "service_a"
@@ -160,11 +162,52 @@ class LocalSubtitleTranslatorAdapter:
 
 
 class TextToAudioAdapter:
-    """Runs Service B's full engine on Service A's rendered video."""
+    """Runs Service B on Service A's rendered video.
 
-    def __init__(self, backend: ArtifactBackend, service_root: Path = SERVICE_B_ROOT):
+    Analyze first (transcript, shots, face candidates, music). If faces were found
+    and the user has not chosen one yet, publish the choices and raise
+    AwaitingFaceSelection; the job is re-queued with `face_choice` once they confirm,
+    and this adapter then resumes from its on-disk caches and renders.
+    """
+
+    def __init__(
+        self,
+        backend: ArtifactBackend,
+        service_root: Path = SERVICE_B_ROOT,
+        face_choice: str | None = None,
+        music_identifier: Any = None,
+        music_fetcher: Any = None,
+    ):
         self.backend = backend
         self.service_root = Path(service_root)
+        self.face_choice = face_choice
+        self.music_identifier = music_identifier
+        self.music_fetcher = music_fetcher
+
+    def _publish(self, path: Path, name: str, content_type: str, job_id: str) -> Artifact:
+        artifact = Artifact(uri=f"artifact://{name}", filename=name, content_type=content_type,
+                            metadata={"path": str(path)})
+        return self.backend.publish(artifact, name=name, job_id=job_id)
+
+    def _publish_music(self, music, music_dir: Path, job_id: str) -> dict[str, Artifact]:
+        music_dir.mkdir(parents=True, exist_ok=True)
+        info_path = music_dir / "music.json"
+        info_path.write_text(json.dumps(music.info, ensure_ascii=False, indent=2), encoding="utf-8")
+        published = {"music_info": self._publish(info_path, "music.json", "application/json", job_id)}
+        if music.track is not None:
+            published["music_track"] = self._publish(music.track, "music_track.mp3", "audio/mpeg", job_id)
+        return published
+
+    def _publish_face_choices(self, candidates, job_dir: Path, job_id: str) -> None:
+        for candidate in candidates:
+            if candidate.crop_file:
+                self._publish(job_dir / "faces" / candidate.crop_file, candidate.crop_file, "image/jpeg", job_id)
+        panel = job_dir / "faces.json"
+        panel.write_text(
+            json.dumps({"candidates": [c.public_view() for c in candidates]}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self._publish(panel, "faces.json", "application/json", job_id)
 
     def run(self, video: Artifact, *, target_language: str, source_language: str = "auto", job_id: str) -> dict[str, Artifact]:
         _add_import_root(self.service_root)
@@ -172,16 +215,48 @@ class TextToAudioAdapter:
         if cached is not None and not Path(cached.__file__).resolve().is_relative_to(self.service_root.resolve()):
             raise RuntimeError("A different top-level 'src' package is already loaded; isolate this application process.")
         engine = importlib.import_module("src.engine")
+        analysis = importlib.import_module("src.analysis")
+        faces = importlib.import_module("src.faces")
+        audio_tools = importlib.import_module("src.audio")
         data_dir = Path(os.getenv("PIPELINE_DATA_DIR", "/data"))
         root = data_dir / "cache" / "service-b" / job_id
         root.mkdir(parents=True, exist_ok=True)
         source = self.backend.download(video, root / "service-a-video.mp4")
+        job_dir = root / "job"
+        ffmpeg_binary = audio_tools.ffmpeg()
+
+        # --- Analyze (cached on disk, so a resume after confirmation is cheap) ---
+        info = analysis.analyze_video(source, job_dir, source_language)
+        music_dir = root / "music"
+        music = identify_and_fetch(
+            source, info["words"], info["duration"], music_dir,
+            self.music_identifier or ShazamIdentifier(),
+            self.music_fetcher or YouTubeFetcher(ffmpeg_location=ffmpeg_binary),
+            ffmpeg_binary=ffmpeg_binary,
+        )
+        print(f"[Music] status={music.status}")
+        extras = self._publish_music(music, music_dir, job_id)
+
+        candidates = faces.load_or_discover(source, info["scenes"], info["words"], job_dir)
+        if not candidates:
+            print("[Faces] No usable face found — dubbing audio-only, no lip-sync.")
+            lock = faces.FaceLock.disabled()
+        elif self.face_choice is None:
+            self._publish_face_choices(candidates, job_dir, job_id)
+            print(f"[Faces] {len(candidates)} candidate(s) found — waiting for the user to confirm one.")
+            raise AwaitingFaceSelection(job_id)
+        else:
+            lock = faces.select_lock(candidates, self.face_choice)
+            print(f"[Faces] Locked face candidate {self.face_choice}.")
+
+        # --- Render ---
         output = engine.run_dubbing_engine(
             source_video_path=source,
             target_lang=target_language,
             source_lang=source_language,
-            job_dir=root / "job",
+            job_dir=job_dir,
             dry_run=os.getenv("DUBBING_DRY_RUN", "false").lower() == "true",
+            face_lock=lock,
         )
         output = Path(output)
         result: dict[str, Artifact] = {
@@ -197,4 +272,5 @@ class TextToAudioAdapter:
             result["audio_subtitles"] = self.backend.upload(
                 audio_srt, filename="audio-subtitles.srt", content_type="application/x-subrip"
             )
+        result.update(extras)
         return result
