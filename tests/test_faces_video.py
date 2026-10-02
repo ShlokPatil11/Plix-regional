@@ -242,3 +242,40 @@ def test_face_engine_with_fake_tracker_no_faces():
     frame = np.zeros((90, 160, 3), dtype=np.uint8)
     detections = engine.detect(frame)
     assert detections == []
+
+
+class BoxEngine:
+    def __init__(self, box, vector):
+        self.box, self.vector = box, vector
+
+    def detect(self, frame):
+        return [(self.box, self.vector)]
+
+
+def test_boxes_are_clamped_to_the_frame(tmp_path):
+    clip = make_video(tmp_path / "clip.mp4", seconds=1.0, size="160x90")
+    lock = FaceLock.from_candidate({"embedding": A.tolist()})
+    boxes, _ = locked_boxes_for_clip(clip, BoxEngine((140, 60, 40, 50), A), lock)
+    assert boxes[0] == [140, 60, 160, 90]
+    boxes, _ = locked_boxes_for_clip(clip, BoxEngine((-10, -5, 40, 50), A), lock)
+    assert boxes[0] == [0, 0, 30, 45]
+
+
+def test_box_entirely_outside_the_frame_is_dropped(tmp_path):
+    clip = make_video(tmp_path / "clip.mp4", seconds=1.0, size="160x90")
+    lock = FaceLock.from_candidate({"embedding": A.tolist()})
+    boxes, presence = locked_boxes_for_clip(clip, BoxEngine((200, 10, 30, 40), A), lock)
+    assert all(box is None for box in boxes) and presence == 0.0
+    boxes, presence = locked_boxes_for_clip(clip, BoxEngine((-50, 10, 30, 40), A), lock)
+    assert all(box is None for box in boxes) and presence == 0.0
+
+
+def test_failed_crop_write_still_returns_candidates(tmp_path, monkeypatch, capsys):
+    from src import faces
+
+    monkeypatch.setattr(faces.cv2, "imwrite", lambda *a, **k: False)
+    video = make_video(tmp_path / "v.mp4", seconds=3.0, size="160x90")
+    scenes, words = scenes_and_words()
+    candidates = discover_candidates(video, scenes, words, tmp_path / "job", ScriptedEngine())
+    assert len(candidates) == 2 and all(c.crop_file is None for c in candidates)
+    assert "crop" in capsys.readouterr().out.lower()

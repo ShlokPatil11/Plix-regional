@@ -235,8 +235,10 @@ def discover_candidates(video_path, scenes: list, words: list, job_dir, engine, 
     for candidate in candidates:
         if candidate.crop is not None:
             name = f"face_cand_{candidate.id}.jpg"
-            cv2.imwrite(str(faces_dir / name), candidate.crop)
-            candidate.crop_file = name
+            if cv2.imwrite(str(faces_dir / name), candidate.crop):
+                candidate.crop_file = name
+            else:
+                print(f"[Faces] WARNING: could not write the crop for candidate {candidate.id}.")
     save_candidates(job_dir / "face_candidates.json", candidates)
     print(f"[Faces] {len(candidates)} face candidate(s) found.")
     return candidates
@@ -261,7 +263,7 @@ def locked_boxes_for_clip(clip_path, engine, lock: FaceLock, threshold: float = 
             ok, frame = capture.read()
             if not ok or frame is None:
                 break
-            frame_h = frame.shape[0]
+            frame_h, frame_w = frame.shape[:2]
             best, best_similarity = None, threshold
             for box, embedding in engine.detect(frame):
                 if box[3] < MIN_FACE_HEIGHT_RATIO * frame_h:
@@ -273,7 +275,10 @@ def locked_boxes_for_clip(clip_path, engine, lock: FaceLock, threshold: float = 
                 boxes.append(None)
             else:
                 x, y, w, h = best
-                boxes.append([max(0, x), max(0, y), max(0, x + w), max(0, y + h)])
+                x1, y1 = min(max(0, x), frame_w), min(max(0, y), frame_h)
+                x2, y2 = min(max(0, x + w), frame_w), min(max(0, y + h), frame_h)
+                # Detections can extend past the frame; Sync Labs wants in-frame boxes.
+                boxes.append([x1, y1, x2, y2] if x2 > x1 and y2 > y1 else None)
     finally:
         capture.release()
     if not boxes:
