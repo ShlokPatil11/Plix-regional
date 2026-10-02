@@ -14,7 +14,7 @@ from pipeline.video_analyzer import analyze
 from pipeline.subtitle_detector import detect
 from pipeline.subtitle_extractor import extract
 from pipeline.burned_subtitle_ocr import extract_burned
-from pipeline.translator import ClaudeTranslationProvider, GeminiTranslationProvider, translate, detect_source_language
+from pipeline.translator import ClaudeTranslationProvider, GeminiTranslationProvider, GroqTranslationProvider, translate, detect_source_language
 from pipeline.subtitle_style import assign_styles, generate
 from pipeline.subtitle_renderer import render
 from pipeline.ffmpeg_utils import output_filename
@@ -393,6 +393,8 @@ class Processor:
                 if self.provider is None:
                     if config.translation_provider == 'gemini':
                         self.provider = GeminiTranslationProvider(config)
+                    elif config.translation_provider == 'groq':
+                        self.provider = GroqTranslationProvider(config)
                     else:
                         self.provider = ClaudeTranslationProvider(config)
                 return translate(segments,self.provider,config,job.source_language,job.target_language)

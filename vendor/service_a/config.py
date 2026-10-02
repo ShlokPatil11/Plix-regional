@@ -16,6 +16,8 @@ class Config:
     model: str = ''
     gemini_api_key: str = field(default='', repr=False)
     gemini_model: str = 'gemini-2.5-flash'
+    groq_api_key: str = field(default='', repr=False)
+    groq_model: str = 'openai/gpt-oss-120b'
     stability_seconds: float = 5
     stability_timeout: float = 600
     max_retries: int = 2
@@ -36,7 +38,7 @@ class Config:
     ocr_bg_variance_threshold: float = 30.0
     ocr_target_box: str = ''
     overlay_patch_color: str = '0xF4D9B9'
-    box_text_color: str = '#1F1916'
+    box_text_color: str = '#FFFFFF'
     removal_mode: str = 'overlay'
     overlay_patch: bool = True
     font_name: str = ''
@@ -76,8 +78,8 @@ class Config:
             raise ValueError('Invalid limits')
         if not self.target_language.strip() or len(self.target_language) > 80:
             raise ValueError('Provide a target language of 1–80 characters')
-        if self.translation_provider not in ('claude', 'gemini'):
-            raise ValueError("TRANSLATION_PROVIDER must be 'claude' or 'gemini'")
+        if self.translation_provider not in ('claude', 'gemini', 'groq'):
+            raise ValueError("TRANSLATION_PROVIDER must be 'claude', 'gemini', or 'groq'")
         import shutil
         winget_pkgs = Path(os.environ.get('LOCALAPPDATA', '')) / 'Microsoft/WinGet/Packages'
         if not shutil.which(self.ffmpeg) and not Path(self.ffmpeg).is_file() and winget_pkgs.is_dir():
@@ -100,6 +102,8 @@ class Config:
             'model':('TRANSLATION_MODEL',str),
             'gemini_api_key':('GEMINI_API_KEY',str),
             'gemini_model':('GEMINI_MODEL',str),
+            'groq_api_key':('GROQ_API_KEY',str),
+            'groq_model':('GROQ_MODEL',str),
             'stability_seconds':('FILE_STABILITY_SECONDS',float),
             'stability_timeout':('FILE_STABILITY_TIMEOUT',float),
             'max_retries':('MAX_RETRIES',int),

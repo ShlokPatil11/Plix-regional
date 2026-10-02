@@ -58,7 +58,7 @@ def assign_styles(segments, metadata, config, document=None):
         outline_w = getattr(config, 'outline_width', 0.0)
         shadow_w = getattr(config, 'shadow_width', 1.0)
         if position == 'box' and box:
-            box_text_color = getattr(config, 'box_text_color', '#000000')
+            box_text_color = getattr(config, 'box_text_color', '#FFFFFF')
             patch_hex = getattr(box, 'patch_color', '') or getattr(config, 'overlay_patch_color', '')
             if patch_hex:
                 clean = patch_hex.lstrip('#').lower().replace('0x', '')

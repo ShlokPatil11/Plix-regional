@@ -1,14 +1,14 @@
 """
 Stage 2 — Scene Classification
 Detects camera cuts, then classifies each shot as:
-  A_ROLL   — target speaker confirmed visible & mouth moving  → send to lipsync
+  A_ROLL   — a meaningful face is visible while speech occurs → send to lipsync
   B_ROLL   — product/background shot, no target speaker      → dubbed audio + original video
   SILENT   — no speech in this interval                      → copy untouched
 
 Uses:
   - PySceneDetect / ffmpeg for cut detection
-  - OpenCV YuNet + SFace for deep face identity (replaces legacy skin-color tracker)
-  - Mouth motion score to separate speaking vs posed shots
+  - OpenCV YuNet for face presence
+  - Sync Labs active-speaker detection chooses the speaking face downstream
 """
 import json
 import cv2
@@ -27,6 +27,7 @@ SFACE_PATH = SERVICE_ROOT / "models" / "face_recognition_sface_2021dec.onnx"
 AROLL_THRESHOLD = 0.70   # SFace cosine similarity ≥ this → target speaker present
 REJECT_THRESHOLD = 0.40  # Below this → definitely not the target speaker
 MOTION_THRESHOLD = 4.0   # Mouth motion score above this → speaker is talking
+MIN_FACE_HEIGHT_RATIO = 0.10  # Ignore tiny background/inset face detections
 
 
 class SceneClassifier:
@@ -210,9 +211,13 @@ class SceneClassifier:
                 "reason": f"Motion-only: score={motion:.2f}",
             }
 
-        # Deep face identity check
+        # Detect a meaningful face. Identity and local motion are retained as
+        # diagnostics, but do not gate lip-sync: the dubbed speech can start or
+        # end inside a shot, and Sync Labs performs active-speaker detection on
+        # the submitted clip more reliably than a single local identity anchor.
         best_sim = -1.0
         best_coords = None
+        largest_face_ratio = 0.0
         for frame in frames:
             h, w = frame.shape[:2]
             self.detector.setInputSize((w, h))
@@ -220,32 +225,31 @@ class SceneClassifier:
             if faces is None:
                 continue
             for face in faces:
+                face_ratio = float(face[3]) / float(h)
+                if face_ratio > largest_face_ratio:
+                    largest_face_ratio = face_ratio
+                    best_coords = [int(v) for v in face[:4]]
                 aligned = self.recognizer.alignCrop(frame, face)
                 emb = self.recognizer.feature(aligned)
                 sim = self._similarity(emb)
                 if sim > best_sim:
                     best_sim = sim
-                    best_coords = [int(v) for v in face[:4]]
 
-        if best_sim >= AROLL_THRESHOLD and motion >= MOTION_THRESHOLD:
+        if largest_face_ratio >= MIN_FACE_HEIGHT_RATIO:
             label = "A_ROLL"
-            reason = f"Target speaker confirmed (sim={best_sim:.2f}, motion={motion:.2f})"
-        elif best_sim >= AROLL_THRESHOLD:
-            # Face present but not talking (posed/listening shot)
-            label = "B_ROLL"
-            reason = f"Target face visible but not speaking (motion={motion:.2f})"
-        elif best_sim >= REJECT_THRESHOLD:
-            label = "B_ROLL"
-            reason = f"Uncertain face (sim={best_sim:.2f}) — treating as B-roll"
+            reason = (f"Speech overlaps meaningful face (height={largest_face_ratio:.2f}, "
+                      f"sim={best_sim:.2f}); Sync Labs will detect active speaker")
         else:
             label = "B_ROLL"
-            reason = f"Non-target face or no face (sim={best_sim:.2f})"
+            reason = (f"No meaningful face (largest height={largest_face_ratio:.2f}, "
+                      f"sim={best_sim:.2f})")
 
         return {
             "class": label,
             "similarity": round(best_sim, 3),
             "motion": round(motion, 2),
             "face_coords": best_coords,
+            "face_height_ratio": round(largest_face_ratio, 3),
             "reason": reason,
         }
 
