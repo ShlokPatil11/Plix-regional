@@ -400,12 +400,17 @@ def extract_burned(video, metadata, config, provider=None):
         if min(x,y)<0 or min(w,h)<=0 or x+w>metadata.width or y+h>metadata.height: raise ValueError('OCR_REGION is outside frame')
     capture=cv2.VideoCapture(str(video))
     if not capture.isOpened(): raise RuntimeError('OpenCV cannot open video for OCR')
-    segments=[]; active=[]; timestamp=0.0
+    segments=[]; active=[]; timestamp=0.0; decoded_any=False
     try:
         while timestamp<metadata.duration:
             capture.set(cv2.CAP_PROP_POS_MSEC,timestamp*1000)
             success,frame=capture.read()
-            if not success: raise RuntimeError(f'OCR frame decode failed at {timestamp:.3f}s')
+            if not success:
+                # The last sample can land after the final frame (e.g. a 10.517 s clip
+                # sampled at 10.5 s): that is the end of the video, not a decode error.
+                if decoded_any and timestamp >= metadata.duration - config.ocr_interval: break
+                raise RuntimeError(f'OCR frame decode failed at {timestamp:.3f}s')
+            decoded_any=True
 
             if target_box == 'beige':
                 beige_box = find_beige_box(frame)
