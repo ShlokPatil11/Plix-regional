@@ -93,7 +93,15 @@ class Config:
 
     @classmethod
     def load(cls, target_language=None, source_language=None):
-        load_dotenv(ROOT / '.env')
+        # Walk up from this file's directory to find the nearest .env
+        _env_path = ROOT
+        for _ in range(6):
+            if (_env_path / '.env').exists():
+                load_dotenv(_env_path / '.env', override=True)
+                break
+            _env_path = _env_path.parent
+        else:
+            load_dotenv(override=True)  # fallback: let python-dotenv search CWD
         mapping = {
             'target_language':('TARGET_LANGUAGE',str),
             'source_language':('SOURCE_LANGUAGE',str),

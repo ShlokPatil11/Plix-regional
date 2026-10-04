@@ -7,6 +7,15 @@ import logging
 import mimetypes
 import os
 from pathlib import Path
+
+# Load .env from this file's directory (or any parent) before anything else
+from dotenv import load_dotenv as _load_dotenv
+_dotenv_path = Path(__file__).resolve().parent
+for _ in range(6):
+    if (_dotenv_path / '.env').exists():
+        _load_dotenv(_dotenv_path / '.env', override=True)
+        break
+    _dotenv_path = _dotenv_path.parent
 import re
 import shutil
 import sys
