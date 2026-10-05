@@ -26,6 +26,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .contracts import AwaitingFaceSelection, PipelineStageError
@@ -205,6 +206,8 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Directory Language Studio", version="1.0.0", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+app.mount("/images", StaticFiles(directory=Path(__file__).parent / "static" / "images"), name="images")
 
 
 @app.get("/", response_class=HTMLResponse)
