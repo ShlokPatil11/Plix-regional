@@ -43,11 +43,11 @@ class PipelineServices:
 
 
 class DirectoryLanguagePipeline:
-    """Chain visual subtitle translation into audio dubbing.
+    """Dub and lip-sync the clean video, then translate its visual subtitles.
 
-    Service A and Service B keep separate subtitle artifacts. Only Service A's
-    video is passed into Service B. The final assembler attaches Service A's
-    visual SRT and uses Service B's audio result.
+    Service B receives the original video so Sync Labs sees clean source frames.
+    Its continuous lip-synced result is then passed to Service A for masking and
+    translated visual overlays. The two subtitle artifacts remain independent.
     """
 
     def __init__(self, services: PipelineServices):
@@ -68,25 +68,9 @@ class DirectoryLanguagePipeline:
 
         try:
             if on_stage:
-                on_stage("service_a_running")
-            visual = self._invoke(
-                self.services.visual_subtitles, video,
-                target_language=target_language, source_language=source_language, job_id=job_id,
-            )
-            service_a_video = self._required(visual, "video", "service_a")
-            visual_srt = self._required(visual, "visual_subtitles", "service_a")
-            if on_stage:
-                on_stage("service_a_completed")
-        except Exception as exc:
-            if isinstance(exc, PipelineStageError):
-                raise
-            raise PipelineStageError("service_a", "visual subtitle translation failed", cause=exc) from exc
-
-        try:
-            if on_stage:
                 on_stage("service_b_running")
             audio = self._invoke(
-                self.services.audio_dubbing, service_a_video,
+                self.services.audio_dubbing, video,
                 target_language=target_language, source_language=source_language, job_id=job_id,
             )
             dubbed_video = audio.get("video")
@@ -103,8 +87,25 @@ class DirectoryLanguagePipeline:
 
         try:
             if on_stage:
+                on_stage("service_a_running")
+            visual_input = dubbed_video or video
+            visual = self._invoke(
+                self.services.visual_subtitles, visual_input,
+                target_language=target_language, source_language=source_language, job_id=job_id,
+            )
+            service_a_video = self._required(visual, "video", "service_a")
+            visual_srt = self._required(visual, "visual_subtitles", "service_a")
+            if on_stage:
+                on_stage("service_a_completed")
+        except Exception as exc:
+            if isinstance(exc, PipelineStageError):
+                raise
+            raise PipelineStageError("service_a", "visual subtitle translation failed", cause=exc) from exc
+
+        try:
+            if on_stage:
                 on_stage("finalizing")
-            assembly_video = dubbed_video or service_a_video
+            assembly_video = service_a_video
             # Only pass the music kwargs when there is music, so host assemblers
             # written against the original signature keep working.
             extra = {"music": music_track, "music_percent": DEFAULT_MUSIC_PERCENT} if music_track else {}

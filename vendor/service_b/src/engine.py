@@ -10,6 +10,7 @@ Unified Dubbing Engine — Orchestrates all 5 stages:
 Entry point: run_dubbing_engine(...)
 """
 import json
+import os
 from pathlib import Path
 
 from .common import PipelineError, load_env
@@ -17,7 +18,7 @@ from .scene_analyzer import get_video_info
 from .transcriber import extract_transcript
 from .classifier import classify_video
 from .el_dubber import run_dubbing
-from .lipsyncer import process_shots
+from .lipsyncer import process_full_video, process_shots, restore_broll_from_source
 from .stitcher import stitch_segments
 
 
@@ -39,6 +40,7 @@ def run_dubbing_engine(
     dry_run: bool = False,
     skip_stages: list[int] = None,
     face_lock=None,
+    full_video_sync: bool | None = None,
 ) -> Path:
     """
     Full 5-stage dubbing pipeline.
@@ -65,6 +67,8 @@ def run_dubbing_engine(
     """
     load_env(ROOT / ".env")
     skip_stages = set(skip_stages or [])
+    if full_video_sync is None:
+        full_video_sync = os.getenv("FULL_VIDEO_SYNC", "true").lower() not in ("0", "false", "no")
 
     source_video = Path(source_video_path).resolve()
     if not source_video.exists():
@@ -195,15 +199,31 @@ def run_dubbing_engine(
     output_clips = []
     if 4 not in skip_stages:
         print("\n[Engine] ── Stage 4: Targeted Lip-Sync ──")
-        output_clips = process_shots(
-            video_path=source_video,
-            dubbed_audio=dubbed_audio,
-            classified_scenes=classified_scenes,
-            job_dir=job_dir,
-            sync_model=sync_model,
-            dry_run=dry_run,
-            lock=face_lock,
-        )
+        if full_video_sync:
+            synced_video = process_full_video(
+                video_path=source_video,
+                dubbed_audio=dubbed_audio,
+                job_dir=job_dir,
+                sync_model=sync_model,
+                dry_run=dry_run,
+                lock=face_lock,
+            )
+            output_clips = restore_broll_from_source(
+                synced_video=synced_video,
+                source_video=source_video,
+                classified_scenes=classified_scenes,
+                job_dir=job_dir,
+            )
+        else:
+            output_clips = process_shots(
+                video_path=source_video,
+                dubbed_audio=dubbed_audio,
+                classified_scenes=classified_scenes,
+                job_dir=job_dir,
+                sync_model=sync_model,
+                dry_run=dry_run,
+                lock=face_lock,
+            )
         # Persist per-shot lip-sync decisions (lip_sync, locked_face_ratio) for review.
         (job_dir / "scenes.json").write_text(
             json.dumps(classified_scenes, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -247,7 +267,7 @@ def run_dubbing_engine(
 
     print(f"\n{'='*60}")
     print(f"[Engine] ✓ DONE — Final video: {final_output}")
-    print(f"[Engine] A-Roll lip-synced: {aroll_count} shots")
+    print(f"[Engine] Lip-sync mode: {'full video' if full_video_sync else 'segmented shots'}")
     print(f"[Engine] B-Roll (audio + original video): {broll_count} shots")
     print(f"{'='*60}\n")
     return final_output

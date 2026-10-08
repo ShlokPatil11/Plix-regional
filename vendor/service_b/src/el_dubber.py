@@ -25,6 +25,7 @@ NOT supported by Dubbing API (use Voice-Clone TTS instead):
 import hashlib
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -48,6 +49,7 @@ EL_DUBBING_SUPPORTED = {
 EL_V4_MODEL = "eleven_v4"           # Best quality, Marathi supported
 EL_V4_TURBO = "eleven_v4_turbo"     # Faster, Marathi supported
 EL_V3_MODEL = "eleven_v3"           # Also Marathi supported
+TRANSLATION_PIPELINE_VERSION = "contextual-v2"
 
 
 def _video_hash(video_path: Path) -> str:
@@ -100,28 +102,155 @@ def _ensure_voice_clone(sample_wav: Path, voice_name: str, api_key: str) -> str:
     return vid
 
 
-def _translate_cues_google(cues: list[Cue], target_lang: str) -> list[Cue]:
+_TARGET_SCRIPTS = {
+    "te": ("Telugu", "\u0c00-\u0c7f"),
+    "mr": ("Devanagari", "\u0900-\u097f"),
+    "hi": ("Devanagari", "\u0900-\u097f"),
+    "ta": ("Tamil", "\u0b80-\u0bff"),
+    "kn": ("Kannada", "\u0c80-\u0cff"),
+    "ml": ("Malayalam", "\u0d00-\u0d7f"),
+}
+
+
+def _validate_target_script(cues: list[Cue], target_lang: str) -> None:
+    expected = _TARGET_SCRIPTS.get(target_lang.lower())
+    if not expected:
+        return
+    script_name, char_range = expected
+    text = " ".join(cue.text for cue in cues)
+    letters = re.findall(r"[^\W\d_]", text, flags=re.UNICODE)
+    target_letters = re.findall(f"[{char_range}]", text)
+    if not target_letters or (letters and len(target_letters) / len(letters) < 0.35):
+        raise PipelineError(
+            f"Translation validation failed: expected {script_name} text for '{target_lang}', "
+            "but the translation service returned text in another script."
+        )
+
+
+def _contains_target_script(text: str, target_lang: str) -> bool:
+    expected = _TARGET_SCRIPTS.get(target_lang.lower())
+    return not expected or bool(re.search(f"[{expected[1]}]", text))
+
+
+def _translate_cues_google(cues: list[Cue], target_lang: str, source_lang: str = "auto") -> list[Cue]:
     """Translate cue texts using unofficial Google Translate (no API key needed)."""
-    from urllib.parse import quote
     translated = []
     for cue in cues:
         text = cue.text.replace("\n", " ").strip()
-        url = (
-            f"https://translate.googleapis.com/translate_a/single"
-            f"?client=gtx&sl=auto&tl={target_lang}&dt=t&q={quote(text)}"
-        )
-        try:
-            r = requests.get(url, timeout=10)
-            if r.ok:
+        translated_text = ""
+        first_success = ""
+        errors = []
+        # Hindi ads are often Hinglish and Whisper may emit Urdu glyphs. Auto is
+        # normally correct; explicit Hindi/Urdu retries recover that common case.
+        source_candidates = [source_lang] if source_lang and source_lang != "auto" else ["auto", "hi", "ur"]
+        for source in source_candidates:
+            try:
+                r = requests.get(
+                    "https://translate.googleapis.com/translate_a/single",
+                    params={"client": "gtx", "sl": source, "tl": target_lang, "dt": "t", "q": text},
+                    timeout=15,
+                )
+                if not r.ok:
+                    errors.append(f"{source}: HTTP {r.status_code}")
+                    continue
                 data = r.json()
-                translated_text = "".join(part[0] for part in data[0] if part[0])
-            else:
-                translated_text = text
-        except Exception:
-            translated_text = text
+                candidate = "".join(part[0] for part in data[0] if part[0]).strip()
+                if candidate and not first_success:
+                    first_success = candidate
+                if candidate and candidate != text and _contains_target_script(candidate, target_lang):
+                    translated_text = candidate
+                    break
+                errors.append(f"{source}: response did not contain the target script")
+            except Exception as exc:
+                errors.append(f"{source}: {exc}")
+        # Preserve brand-only or numeric cues when the provider intentionally
+        # leaves them unchanged; whole-track validation below still prevents a
+        # non-Telugu transcript from being synthesized as Telugu.
+        if not translated_text:
+            translated_text = first_success
+        if not translated_text:
+            raise PipelineError(f"Translation failed for cue {cue.id}: {'; '.join(errors)}")
         new_cue = Cue(cue.id, cue.start_ms, cue.end_ms, translated_text)
         translated.append(new_cue)
         print(f"  [{cue.id}] {text[:40]} → {translated_text[:40]}")
+    _validate_target_script(translated, target_lang)
+    return translated
+
+
+def _translate_cues_gemini(cues: list[Cue], target_lang: str, source_lang: str = "auto") -> list[Cue]:
+    """Translate the complete transcript as one context-aware unit.
+
+    Local Whisper can emit mixed scripts for Hinglish. Translating those fragments
+    independently caused phonetic accidents such as "change kiya" becoming
+    "chimta kadhla". Full-transcript context lets the model repair only obvious
+    ASR corruption while retaining product names and meaning.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise PipelineError("GEMINI_API_KEY is required for contextual dubbing translation.")
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        raise PipelineError("google-genai is required for contextual dubbing translation.") from exc
+
+    language_names = {
+        "mr": "Marathi in Devanagari", "te": "Telugu", "hi": "Hindi in Devanagari",
+        "ta": "Tamil", "kn": "Kannada", "ml": "Malayalam",
+    }
+    target_name = language_names.get(target_lang.lower(), target_lang)
+    rows = [{"id": cue.id, "text": cue.text.replace("\n", " ").strip()} for cue in cues]
+    prompt = f"""You are localizing a short consumer-health advertisement.
+Translate the transcript into natural spoken {target_name}.
+The source language is {source_lang}; it may be Hinglish and may contain isolated
+wrong-script characters caused by speech recognition. Correct only obvious ASR
+phonetic corruption using the full transcript context. Do not add claims or new
+objects. Preserve brand/product names (especially PLIX and ACV), numbers, and cue
+IDs. Never transliterate the target language into Latin letters.
+
+Return only a JSON array shaped exactly like:
+[{{"id": 1, "text": "translated text"}}]
+
+Transcript:
+{json.dumps(rows, ensure_ascii=False)}"""
+
+    configured = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash").strip()
+    models = list(dict.fromkeys([configured, "gemini-3.5-flash", "gemini-3.5-flash-lite"]))
+    errors = []
+    result = None
+    client = genai.Client(api_key=api_key)
+    for model in models:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    response_mime_type="application/json",
+                ),
+            )
+            result = json.loads(response.text or "")
+            if isinstance(result, dict):
+                result = result.get("translations")
+            if isinstance(result, list):
+                break
+            raise ValueError("response was not a JSON array")
+        except Exception as exc:
+            errors.append(f"{model}: {exc}")
+            result = None
+    if result is None:
+        raise PipelineError(f"Contextual translation failed: {'; '.join(errors)}")
+
+    by_id = {str(item.get("id")): str(item.get("text", "")).strip()
+             for item in result if isinstance(item, dict)}
+    translated = []
+    for cue in cues:
+        text = by_id.get(str(cue.id), "")
+        if not text:
+            raise PipelineError(f"Contextual translation omitted cue {cue.id}; dubbing stopped.")
+        translated.append(Cue(cue.id, cue.start_ms, cue.end_ms, text))
+        print(f"  [{cue.id}] {cue.text[:40]} → {text[:40]}")
+    _validate_target_script(translated, target_lang)
     return translated
 
 
@@ -155,7 +284,8 @@ def _assemble_tts_audio(
 ) -> Path:
     """
     Assemble per-cue audio files into a single full-length audio track.
-    Each cue is placed at its start_ms position. Gaps are silence.
+    Every clip is tempo-fitted, trimmed and padded to its cue window before it
+    is placed on the timeline, so adjacent voices can never overlap.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # Build ffmpeg complex filter
@@ -163,19 +293,63 @@ def _assemble_tts_audio(
     filter_parts = []
     delay_parts = []
 
+    def probe_duration(path: Path) -> float:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True,
+        )
+        try:
+            duration = float(result.stdout.strip())
+        except (TypeError, ValueError):
+            duration = 0.0
+        if result.returncode or duration <= 0:
+            raise PipelineError(f"Could not measure generated TTS cue: {path.name}")
+        return duration
+
+    def atempo_filters(speed: float) -> list[str]:
+        # Keep individual factors in FFmpeg's high-quality 0.5-2.0 range.
+        factors = []
+        while speed > 2.0:
+            factors.append(2.0)
+            speed /= 2.0
+        if speed > 1.0005:
+            factors.append(speed)
+        return [f"atempo={factor:.8f}" for factor in factors]
+
     for i, (cue, audio_path) in enumerate(zip(cues, cue_audio_paths)):
         if not audio_path.exists():
             continue
         start_ms = int(cue.start_ms)
+        window_s = (int(cue.end_ms) - start_ms) / 1000.0
+        if window_s <= 0:
+            raise PipelineError(f"TTS cue {cue.id} has a non-positive timeline window.")
+        source_s = probe_duration(audio_path)
+        speed = max(1.0, source_s / window_s)
+        fit = atempo_filters(speed)
+        if speed > 1.0005:
+            print(
+                f"[Dubber] Time-fitting cue {cue.id}: {source_s:.2f}s into "
+                f"{window_s:.2f}s ({speed:.2f}x)"
+            )
         inputs += ["-i", str(audio_path)]
-        filter_parts.append(f"[{i}:a]adelay={start_ms}|{start_ms}[a{i}]")
+        filters = [
+            *fit,
+            f"atrim=start=0:duration={window_s:.6f}",
+            "asetpts=PTS-STARTPTS",
+            f"apad=pad_dur={window_s:.6f}",
+            f"atrim=start=0:duration={window_s:.6f}",
+            f"adelay={start_ms}|{start_ms}",
+        ]
+        filter_parts.append(f"[{i}:a]{','.join(filters)}[a{i}]")
         delay_parts.append(f"[a{i}]")
 
     if not delay_parts:
         raise PipelineError("No cue audio files were generated.")
 
-    mix_filter = "".join(delay_parts) + f"amix=inputs={len(delay_parts)}:normalize=0[out]"
-    full_filter = ";".join(filter_parts) + ";" + mix_filter
+    mix_filter = "".join(delay_parts) + f"amix=inputs={len(delay_parts)}:normalize=0[mix]"
+    finish_filter = f"[mix]apad=pad_dur={total_duration_s:.6f},atrim=duration={total_duration_s:.6f}[out]"
+    full_filter = ";".join(filter_parts) + ";" + mix_filter + ";" + finish_filter
 
     cmd = [
         "ffmpeg", "-y", "-nostdin",
@@ -317,10 +491,15 @@ def run_dubbing(
     dubbed_audio = job_dir / f"dubbed_master_{target_lang}.mp3"
     dubbed_srt = job_dir / f"transcript_{target_lang}.srt"
     job_id_path = job_dir / f"el_dubbing_id_{target_lang}.txt"
+    translation_version_path = job_dir / f"translation_{target_lang}.version"
 
     # Cache check — ignore PLACEHOLDER files from dry-runs (< 500KB is likely a placeholder)
     REAL_AUDIO_MIN_BYTES = 500 * 1024  # 500KB
-    if (dubbed_audio.exists()
+    cache_version_ok = (target_lang in EL_DUBBING_SUPPORTED or (
+        translation_version_path.exists()
+        and translation_version_path.read_text(encoding="utf-8").strip() == TRANSLATION_PIPELINE_VERSION
+    ))
+    if (cache_version_ok and dubbed_audio.exists()
             and dubbed_audio.stat().st_size >= REAL_AUDIO_MIN_BYTES
             and dubbed_srt.exists()
             and dubbed_srt.stat().st_size > 100
@@ -359,8 +538,8 @@ def run_dubbing(
         print(f"[Dubber] Using supplied translated SRT: {Path(translated_srt).name}")
         target_cues = parse_srt(Path(translated_srt).read_text(encoding="utf-8"))
     elif source_cues:
-        print(f"[Dubber] Translating {len(source_cues)} cues to {target_lang} via Google Translate...")
-        target_cues = _translate_cues_google(source_cues, target_lang)
+        print(f"[Dubber] Translating {len(source_cues)} cues to {target_lang} with full-transcript context...")
+        target_cues = _translate_cues_gemini(source_cues, target_lang, source_lang)
         # Save translated SRT
         srt_lines = []
         for i, cue in enumerate(target_cues, 1):
@@ -371,6 +550,7 @@ def run_dubbing(
                 return f"{h:02d}:{m:02d}:{s:02d},{ms_:03d}"
             srt_lines.append(f"{i}\n{_fmt(cue.start_ms)} --> {_fmt(cue.end_ms)}\n{cue.text}\n")
         dubbed_srt.write_text("\n".join(srt_lines), encoding="utf-8")
+        translation_version_path.write_text(TRANSLATION_PIPELINE_VERSION, encoding="utf-8")
     else:
         raise PipelineError(
             f"Language '{target_lang}' is not supported by ElevenLabs Dubbing API.\n"
@@ -378,6 +558,8 @@ def run_dubbing(
             f"  --transcript <source_srt>  (will be auto-translated)\n"
             f"  --reviewed-srt <marathi_srt>  (pre-translated Marathi SRT)"
         )
+
+    _validate_target_script(target_cues, target_lang)
 
     # Step B2: Extract voice sample & clone
     sample_wav = job_dir / "voice_sample.wav"

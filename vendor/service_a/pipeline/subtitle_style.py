@@ -1,6 +1,7 @@
 import copy
 import logging
 import re
+from pathlib import Path
 import pysubs2
 from models.subtitle import SubtitleStyle
 
@@ -9,15 +10,45 @@ _LANGUAGE_FONTS = {
     'hindi':     'NotoSansDevanagari-Regular',
     'kannada':   'NotoSansKannada-Regular',
     'tamil':     'NotoSansTamil-Regular',
+    'telugu':    'NotoSansTelugu-Regular',
+    'te':        'NotoSansTelugu-Regular',
     'malayalam': 'NotoSansMalayalam-Regular',
 }
+
+_SYSTEM_FONT_FILES = {
+    'NotoSansTelugu-Regular': (
+        '/usr/share/fonts/truetype/noto/NotoSansTelugu-Regular.ttf',
+        '/System/Library/Fonts/KohinoorTelugu.ttc',
+        '/System/Library/Fonts/Supplemental/Telugu MN.ttc',
+        'C:/Windows/Fonts/Nirmala.ttf',
+        'C:/Windows/Fonts/Nirmala.ttc',
+    ),
+}
+
+def resolve_font_file(config, target_language=None):
+    """Return a real font file for the requested language, or None."""
+    language = (target_language or getattr(config, 'target_language', '') or '').lower()
+    preferred = _LANGUAGE_FONTS.get(language)
+    fonts = sorted([*config.font_dir.glob('*.ttf'), *config.font_dir.glob('*.otf'), *config.font_dir.glob('*.ttc')])
+    if preferred:
+        bundled = next((font for font in fonts if font.stem.casefold() == preferred.casefold()), None)
+        if bundled:
+            return bundled
+        system = next((Path(path) for path in _SYSTEM_FONT_FILES.get(preferred, ()) if Path(path).is_file()), None)
+        if system:
+            return system
+        raise RuntimeError(
+            f"No font with {language or 'target-language'} glyphs is installed. "
+            f"Install or bundle {preferred}.ttf."
+        )
+    return None
 
 def choose_font(config, original=None):
     if original: return original  # libass performs system fallback when absent
     fonts=sorted([*config.font_dir.glob('*.ttf'),*config.font_dir.glob('*.otf')])
     preferred=_LANGUAGE_FONTS.get(getattr(config,'target_language','').lower())
     if preferred:
-        match=next((f for f in fonts if f.stem.casefold()==preferred.casefold()),None)
+        match=resolve_font_file(config)
         if match:
             try:
                 from PIL import ImageFont

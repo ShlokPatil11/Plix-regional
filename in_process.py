@@ -8,6 +8,8 @@ from .media import FfmpegFinalAssembler
 from .mixer import DEFAULT_MUSIC_PERCENT, MixError, mix_final
 from .runner import DirectoryLanguagePipeline, PipelineServices
 from .service_adapters import LocalSubtitleTranslatorAdapter, TextToAudioAdapter
+from .clean_translate import run_clean_translate
+from .magnific_oauth import MagnificAuth
 
 
 def _mix_dubbed_only(backend, voice: Artifact, music: Artifact, job_id: str) -> Artifact:
@@ -24,6 +26,23 @@ def _mix_dubbed_only(backend, voice: Artifact, music: Artifact, job_id: str) -> 
         artifact = Artifact(uri="artifact://dubbed-mixed.mp4", filename="dubbed-mixed.mp4",
                             content_type="video/mp4", metadata={"path": str(mixed)})
         return backend.publish(artifact, name="dubbed_video.mp4", job_id=job_id)
+
+
+def _run_clean_stage(input_artifact, target_language, backend, job_id, on_stage=None):
+    data_dir = Path(__import__("os").getenv(
+        "PIPELINE_DATA_DIR", str(Path(tempfile.gettempdir()) / "dir-language-pipeline"))).resolve()
+    source = Path(str(input_artifact.metadata.get("path", "")))
+    if not source.is_file():
+        source = backend.download(input_artifact, Path(backend.root) / "clean-source.mp4")
+    outputs = run_clean_translate(
+        source, target_language, Path(backend.root) / "clean-work",
+        MagnificAuth(data_dir / "magnific-oauth.json"), on_stage,
+    )
+    return {
+        name: backend.upload(path, filename=path.name,
+                             content_type="video/mp4" if path.suffix == ".mp4" else "application/x-subrip")
+        for name, path in outputs.items()
+    }
 
 
 def run_artifact(
@@ -66,44 +85,41 @@ def run_operation(
     """Run masking, dubbing, or both and publish only that operation's outputs."""
     job_id = job_id or "job"
     if operation == "combine":
-        result = run_artifact(
-            input_artifact, target_language=target_language, backend=backend,
-            source_language=source_language, job_id=job_id, on_stage=on_stage,
-            face_choice=face_choice,
-        )
-        artifacts = {
-            "final_video": result.final_video,
-            "visual_subtitles": result.visual_subtitles,
-            "service_a_video": result.service_a_video,
-        }
-        if result.audio_subtitles:
-            artifacts["audio_subtitles"] = result.audio_subtitles
-        if result.service_b_video:
-            artifacts["service_b_video"] = result.service_b_video
-        if result.service_b_audio:
-            artifacts["service_b_audio"] = result.service_b_audio
-        if result.service_b_video:
-            artifacts["voice_video"] = backend.publish(
-                result.service_b_video, name="voice_video.mp4", job_id=job_id
-            )
-        if result.music_track:
-            artifacts["music_track"] = result.music_track
-        if result.music_info:
-            artifacts["music_info"] = result.music_info
-        return {name: artifact for name, artifact in artifacts.items() if artifact is not None}
-
-    if operation == "masking":
+        clean = _run_clean_stage(input_artifact, target_language, backend, job_id, on_stage)
         if on_stage:
-            on_stage("masking_running")
-        output = LocalSubtitleTranslatorAdapter(backend).run(
-            input_artifact, target_language=target_language,
+            on_stage("dubbing_clean_video")
+        dubbed = TextToAudioAdapter(backend, face_choice=face_choice).run(
+            clean["final_video"], target_language=target_language,
             source_language=source_language, job_id=job_id,
         )
-        video = backend.publish(output["video"], name="masking_video.mp4", job_id=job_id)
-        subtitles = backend.publish(output["visual_subtitles"], name="visual_subtitles.srt", job_id=job_id)
+        voice = dubbed["video"]
+        music = dubbed.get("music_track")
+        if music is not None:
+            combined = _mix_dubbed_only(backend, voice, music, job_id)
+        else:
+            combined = backend.publish(voice, name="dubbed_video.mp4", job_id=job_id)
+        final = backend.publish(combined, name="final_video.mp4", job_id=job_id)
+        artifacts = {"final_video": final, "masking_video": clean["final_video"],
+                     "clean_video": clean["clean_video"], "translated_captions": clean["translated_captions"],
+                     "service_b_video": voice,
+                     "voice_video": backend.publish(voice, name="voice_video.mp4", job_id=job_id)}
+        if dubbed.get("music_track"):
+            artifacts["music_track"] = dubbed["music_track"]
+        if dubbed.get("music_info"):
+            artifacts["music_info"] = dubbed["music_info"]
+        if dubbed.get("audio"):
+            artifacts["service_b_audio"] = dubbed["audio"]
+        if dubbed.get("audio_subtitles"):
+            artifacts["audio_subtitles"] = dubbed["audio_subtitles"]
+        return artifacts
+
+    if operation == "masking":
+        output = _run_clean_stage(input_artifact, target_language, backend, job_id, on_stage)
+        video = backend.publish(output["final_video"], name="masking_video.mp4", job_id=job_id)
         if on_stage:
             on_stage("masking_completed")
-        return {"final_video": video, "masking_video": video, "visual_subtitles": subtitles}
+        return {"final_video": video, "masking_video": video, "clean_video": output["clean_video"],
+                "translated_captions": output["translated_captions"]}
 
     if operation == "dubbing":
         if on_stage:

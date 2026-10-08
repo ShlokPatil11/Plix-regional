@@ -60,6 +60,34 @@ def test_pause_is_not_wrapped_in_a_stage_error(tmp_path):
         pipeline.run(source, target_language="hi", job_id="job1")
 
 
+def test_combine_lipsyncs_clean_source_before_visual_masking(tmp_path):
+    backend = FileArtifactBackend(tmp_path / "art")
+    source = artifact(backend, make_video(tmp_path / "in.mp4"), "in.mp4", "video/mp4")
+    calls = []
+
+    class AudioFirst:
+        def run(self, video, **kwargs):
+            calls.append(("audio", video.filename))
+            return {"video": Artifact("artifact://synced", "synced.mp4", "video/mp4",
+                                      {"path": video.metadata["path"]})}
+
+    class VisualSecond:
+        def run(self, video, **kwargs):
+            calls.append(("visual", video.filename))
+            srt = tmp_path / "visual.srt"
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\ntranslated\n", encoding="utf-8")
+            return {"video": video, "visual_subtitles": artifact(
+                backend, srt, "visual.srt", "application/x-subrip")}
+
+    pipeline = DirectoryLanguagePipeline(PipelineServices(
+        visual_subtitles=VisualSecond(), audio_dubbing=AudioFirst(),
+        assembler=FfmpegFinalAssembler(backend), publisher=backend,
+    ))
+    pipeline.run(source, target_language="hi", job_id="job1")
+
+    assert calls == [("audio", "in.mp4"), ("visual", "synced.mp4")]
+
+
 def test_music_flows_to_the_assembler_and_into_the_result(tmp_path):
     backend = FileArtifactBackend(tmp_path / "art")
     source = artifact(backend, make_video(tmp_path / "in.mp4"), "in.mp4", "video/mp4")

@@ -13,7 +13,7 @@ from dotenv import load_dotenv as _load_dotenv
 _dotenv_path = Path(__file__).resolve().parent
 for _ in range(6):
     if (_dotenv_path / '.env').exists():
-        _load_dotenv(_dotenv_path / '.env', override=True)
+        _load_dotenv(_dotenv_path / '.env', override=False)
         break
     _dotenv_path = _dotenv_path.parent
 import re
@@ -24,8 +24,8 @@ import threading
 import traceback
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -33,6 +33,7 @@ from .contracts import AwaitingFaceSelection, PipelineStageError
 from .in_process import run_operation
 from .job_store import JobStore
 from .media import FileArtifactBackend
+from .magnific_oauth import MagnificAuth
 from .mixer import DEFAULT_MUSIC_PERCENT, MixError, mix_final
 from .music import MusicFetchError, YouTubeFetcher, media_duration, prepare_custom_track
 from .service_adapters import LANGUAGES
@@ -43,6 +44,7 @@ MAX_UPLOAD_BYTES = int(os.getenv("PIPELINE_MAX_UPLOAD_BYTES", str(2 * 1024 * 102
 JOB_ROOT = DATA_DIR / "jobs"
 JOB_ROOT.mkdir(parents=True, exist_ok=True)
 store = JobStore(DATA_DIR / "jobs.sqlite3")
+magnific_auth = MagnificAuth(DATA_DIR / "magnific-oauth.json")
 stop_worker = threading.Event()
 worker_thread: threading.Thread | None = None
 CROP_NAME = re.compile(r"^face_cand_\d+\.jpg$")
@@ -228,6 +230,33 @@ def health():
     }
 
 
+@app.get("/api/magnific/status")
+def magnific_status():
+    return magnific_auth.status()
+
+
+@app.get("/api/magnific/connect")
+def magnific_connect(request: Request):
+    redirect_uri = str(request.url_for("magnific_callback"))
+    try:
+        return RedirectResponse(magnific_auth.begin(redirect_uri))
+    except Exception as exc:
+        raise HTTPException(502, f"Could not start Magnific login: {exc}") from exc
+
+
+@app.get("/api/magnific/callback", name="magnific_callback")
+def magnific_callback(code: str | None = None, state: str | None = None, error: str | None = None):
+    if error:
+        raise HTTPException(400, f"Magnific denied the connection: {error}")
+    if not code or not state:
+        raise HTTPException(400, "Magnific callback is missing its authorization code or state")
+    try:
+        magnific_auth.finish(state, code)
+    except Exception as exc:
+        raise HTTPException(502, f"Could not complete Magnific login: {exc}") from exc
+    return RedirectResponse("/?magnific=connected")
+
+
 @app.post("/api/jobs", status_code=202)
 async def submit_job(
     file: UploadFile = File(...),
@@ -236,7 +265,9 @@ async def submit_job(
     operation: str = Form("combine"),
 ):
     if operation not in {"masking", "dubbing", "combine"}:
-        raise HTTPException(422, "Operation must be masking, dubbing, or combine.")
+        raise HTTPException(422, "Unsupported operation.")
+    if operation in {"masking", "combine"} and not magnific_auth.status()["connected"]:
+        raise HTTPException(409, "Connect Magnific before starting Masking or Combine.")
     target = target_language.lower().strip()
     if target not in LANGUAGES:
         raise HTTPException(422, f"Unsupported target language code: {target}")

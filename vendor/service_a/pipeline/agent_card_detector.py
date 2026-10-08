@@ -59,6 +59,10 @@ class AgentCardDetector:
         prompt = (
             "Analyze this video keyframe. Detect the on-screen spoken dialogue or subtitle card/pill container.\n"
             "The subtitle/card container can appear anywhere: lower area (subtitles), middle, or top.\n"
+            "The container is a graphic overlay added on top of the footage (a pill, bar, or box), NOT part of the physical scene. "
+            "NEVER select text printed on a physical object/prop in the scene (e.g. a product bottle, box, tube, or ingredient label "
+            "someone is holding or that is on display), speaker name badges, logos, or brand splash screens - set card_detected to "
+            "false if no genuine subtitle overlay is visible.\n"
             "CRITICAL: The bounding box MUST encompass the ENTIRE card/pill container from its very top boundary "
             "to its bottom boundary, and full width from left curve/edge to right curve/edge. Do not restrict the box to just the inner text.\n"
             "Return a JSON object with:\n"
@@ -186,8 +190,11 @@ class AgentCardDetector:
                     "1. Every visual dialogue text change (typically every 1 to 2.5 seconds, 2 to 5 words) MUST be its own separate card.\n"
                     "   DO NOT merge multiple lines or sentences into one card! Each card corresponds to a separate on-screen pill.\n"
                     "2. Start and end timestamps must be precise numbers in seconds matching the yellow timecode when that specific card appears and disappears.\n"
-                    "3. Only extract spoken dialogue cards. DO NOT extract doctor name tags ('Dr. Priyanta Satiya'), permanent logos, or brand splash screens.\n"
-                    "4. When spoken dialogue finishes (around 01:03-01:04), STOP. Do NOT create cards for the outro slides or product splash screens.\n"
+                    "3. Only extract spoken dialogue cards. DO NOT extract doctor/speaker name tags, permanent logos, or brand splash screens.\n"
+                    "4. DO NOT extract text printed on physical objects or props in the scene - e.g. product packaging, bottle/box/tube labels, "
+                    "ingredient panels, or any writing on an item someone is holding or that is on display. That is product text, not a dialogue "
+                    "subtitle, even if it is readable on screen at the same time as the speaker.\n"
+                    "5. When spoken dialogue finishes, STOP. Do NOT create cards for the outro slides or product splash screens.\n"
                     "Return a JSON array of objects with:\n"
                     "  - start: float (seconds)\n"
                     "  - end: float (seconds)\n"
@@ -288,9 +295,14 @@ class AgentCardDetector:
                     "For EACH image, find the exact on-screen container/pill displaying the specified spoken dialogue:\n"
                     f"{img_desc_text}\n\n"
                     "CRITICAL RULES:\n"
-                    "1. ONLY locate the container/pill displaying the matching dialogue text above.\n"
-                    "2. NEVER select speaker name badges (such as 'Dr. Priya', 'Dr. Priyanta Satiya'), prop stands (such as 'Glutathione' on a model), diagram labels, or brand logos.\n"
-                    "3. If the dialogue subtitle is at the bottom, return the bottom box. If it moved up into the middle or top, return the middle/top box where that dialogue appears.\n"
+                    "1. ONLY locate the container/pill displaying the matching dialogue text above. The subtitle container is an overlay graphic "
+                    "(a pill, bar, or box added on top of the footage) that is NOT part of the physical scene.\n"
+                    "2. NEVER select speaker name badges, diagram labels, brand logos, or text printed on a physical object/prop in the scene "
+                    "(e.g. a product bottle, box, tube, or ingredient label someone is holding or that is on display) even if that text happens "
+                    "to overlap or share words with the dialogue above. Product packaging is part of the filmed scene, not a subtitle overlay.\n"
+                    "3. If you cannot find a genuine subtitle overlay matching the dialogue text in an image, set card_detected to false for it "
+                    "instead of guessing at the nearest text.\n"
+                    "4. If the dialogue subtitle is at the bottom, return the bottom box. If it moved up into the middle or top, return the middle/top box where that dialogue appears.\n"
                     f"Return a JSON array of {len(imgs)} objects in exact matching order:\n"
                     "- image_index: integer (1 to {len(imgs)})\n"
                     "- card_detected: boolean (true if the matching dialogue subtitle card is visible)\n"
@@ -362,8 +374,8 @@ class AgentCardDetector:
                         patch_color = getattr(self.config, 'overlay_patch_color', '0x000000')
                     bbox = BoundingBox(abs_x, abs_y, abs_w, abs_h, patch_color=patch_color)
                 else:
-                    logger.warning('No subtitle-card box was confirmed for segment %d; falling back to the next OCR detector', idx + 1)
-                    return []
+                    logger.warning('No subtitle-card box was confirmed for segment %d (%r); skipping this segment only', idx + 1, item['text'])
+                    continue
 
                 segments.append(SubtitleSegment(
                     len(segments) + 1,
@@ -378,12 +390,13 @@ class AgentCardDetector:
             if segments and segments[0].start <= 0.8:
                 segments[0].start = 0.0
 
-            # Bridge small gaps between consecutive segments (<= 0.8s) so background mask never flickers off
+            # Bridge gaps between consecutive segments so the background mask never flickers off
+            # mid-sentence, including gaps left by a segment that was skipped in Step 4 for
+            # lacking a confirmed box - better to hold the previous patch a bit longer than to
+            # expose the original un-translated source text underneath.
             for i in range(len(segments) - 1):
                 gap = segments[i + 1].start - segments[i].end
-                if 0 <= gap <= 0.8:
-                    segments[i].end = segments[i + 1].start
-                elif gap < 0:
+                if gap <= 3.0:
                     segments[i].end = segments[i + 1].start
 
             return [s for s in segments if s.end > s.start + 0.15]

@@ -96,6 +96,122 @@ def _audio_only_clip(raw_clip: Path, audio_slice: Path, out_path: Path, duration
     return out_path
 
 
+def process_full_video(
+    video_path: Path,
+    dubbed_audio: Path,
+    job_dir: Path,
+    sync_model: str = "lipsync-2-pro",
+    dry_run: bool = False,
+    lock: "FaceLock | None" = None,
+    face_engine=None,
+) -> Path:
+    """Submit one continuous video and dubbed-audio track to Sync Labs."""
+    job_dir = Path(job_dir)
+    full_dir = job_dir / "full_video_sync"
+    full_dir.mkdir(parents=True, exist_ok=True)
+    duration = get_video_info(video_path)["duration"]
+    audio_wav = full_dir / "dubbed_full.wav"
+    if not audio_wav.exists():
+        _extract_audio_slice(dubbed_audio, 0.0, duration, audio_wav)
+
+    fallback = full_dir / "full_audio_only.mp4"
+    if dry_run or (lock is not None and not lock.enabled):
+        reason = "DRY RUN" if dry_run else "no face locked"
+        print(f"[LipSync] Full-video sync skipped ({reason}); dubbing audio only")
+        return _audio_only_clip(video_path, audio_wav, fallback, duration)
+
+    lock_tag = f"_{lock.tag}" if lock is not None else "_AUTO"
+    content_hash = _file_hash(video_path) + _file_hash(audio_wav)
+    synced_out = full_dir / f"full_{content_hash}{lock_tag}_synced.mp4"
+    if synced_out.exists():
+        print(f"[LipSync] Reusing cached full-video Sync result: {synced_out.name}")
+        return synced_out
+
+    options = {
+        "sync_mode": "cut_off",
+        "active_speaker_detection": {"auto_detect": True},
+    }
+    if lock is not None and lock.enabled:
+        engine = face_engine or FaceEngine()
+        boxes, presence = locked_boxes_for_clip(video_path, engine, lock)
+        print(f"[LipSync] Selected face is visible in {presence:.0%} of full-video frames")
+        if not any(box is not None for box in boxes):
+            print("[LipSync] Selected face was not found; dubbing audio only")
+            return _audio_only_clip(video_path, audio_wav, fallback, duration)
+        options["active_speaker_detection"] = build_sync_options(boxes)
+
+    print(f"[LipSync] Uploading complete {duration:.2f}s video and dubbed audio to Sync Labs {sync_model}...")
+    client = SyncLabsClient(default_model=sync_model)
+    try:
+        video_url = client.upload_file(video_path, content_type="video/mp4")
+        audio_url = client.upload_file(audio_wav, content_type="audio/wav")
+        generation = client.generate(video_url, audio_url, model=sync_model, options=options)
+        print(f"[LipSync] Full-video Sync job: {generation['id']} — waiting...")
+        result = client.wait_for_completion(generation["id"], poll_interval=8)
+        client.download_result(result["outputUrl"], synced_out)
+        print(f"[LipSync] Downloaded full-video result → {synced_out.name}")
+        return synced_out
+    except PipelineError as exc:
+        print(f"[LipSync] Full-video Sync failed ({exc}); using dubbed audio without mouth edits")
+        return _audio_only_clip(video_path, audio_wav, fallback, duration)
+
+
+def restore_broll_from_source(
+    synced_video: Path,
+    source_video: Path,
+    classified_scenes: list[dict],
+    job_dir: Path,
+) -> list[Path]:
+    """Split a full-video Sync result and replace B-roll with original frames.
+
+    Sync Labs gets the continuous video so that face lock and mouth motion have
+    full temporal context.  After it returns, Service B's existing scene map is
+    used only as an edit decision list: B_ROLL ranges come from ``source_video``
+    and every other range comes from ``synced_video``.  Stage 5 subsequently
+    lays the continuous dubbed master audio over these video-only decisions.
+    """
+    synced_video = Path(synced_video)
+    source_video = Path(source_video)
+    restore_dir = Path(job_dir) / "full_video_sync" / "restored_segments"
+    restore_dir.mkdir(parents=True, exist_ok=True)
+
+    source_info = get_video_info(source_video)
+    fps = source_info["fps"]
+    source_duration = source_info["duration"]
+    output_clips: list[Path] = []
+    synced_hash = _file_hash(synced_video)
+    source_hash = _file_hash(source_video)
+
+    for i, scene in enumerate(classified_scenes):
+        start_s = max(0.0, float(scene["start"]))
+        end_s = min(float(scene["end"]), source_duration)
+        if end_s <= start_s:
+            continue
+
+        scene_class = scene.get("class", "B_ROLL")
+        use_original = scene_class in {"B_ROLL", "SILENT"}
+        class_tag = "broll" if scene_class == "B_ROLL" else scene_class.lower()
+        selected_video = source_video if use_original else synced_video
+        kind = f"original_{class_tag}" if use_original else "synced"
+        media_hash = source_hash if use_original else synced_hash
+        time_key = f"{int(round(start_s * 1000))}_{int(round(end_s * 1000))}"
+        out = restore_dir / f"seg_{i:03d}_{time_key}_{media_hash}_{kind}.mp4"
+        if not out.exists():
+            extract_subclip(selected_video, start_s, end_s, out, target_fps=fps)
+
+        scene["lip_sync"] = f"restored_original_{class_tag}" if use_original else "full_video"
+        output_clips.append(out)
+
+    if not output_clips:
+        raise PipelineError("Full-video B-roll restoration produced no segments.")
+
+    broll_restored = sum(1 for scene in classified_scenes if scene.get("class") == "B_ROLL")
+    silent_restored = sum(1 for scene in classified_scenes if scene.get("class") == "SILENT")
+    print(f"[LipSync] Restored {broll_restored} B-roll and {silent_restored} silent "
+          "section(s) from the untouched source")
+    return output_clips
+
+
 def process_shots(
     video_path: Path,
     dubbed_audio: Path,

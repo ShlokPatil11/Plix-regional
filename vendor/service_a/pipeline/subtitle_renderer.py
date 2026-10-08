@@ -5,17 +5,14 @@ from pipeline.burned_subtitle_ocr import OverlayRemoval, InpaintingRemoval, Delo
 
 def render_pill_overlays(video, segments, config, folder):
     from PIL import Image, ImageDraw, ImageFont
-    from pipeline.subtitle_style import choose_font, _LANGUAGE_FONTS
+    from pipeline.subtitle_style import choose_font, resolve_font_file
     
     font_file = None
     target_lang = getattr(config, 'target_language', '').lower()
-    pref_stem = _LANGUAGE_FONTS.get(target_lang, '').lower()
     candidates = [*config.font_dir.glob('*.ttf'), *config.font_dir.glob('*.otf')]
-    if pref_stem:
-        for c in candidates:
-            if c.stem.lower() == pref_stem:
-                font_file = str(c)
-                break
+    preferred_file = resolve_font_file(config, target_lang)
+    if preferred_file:
+        font_file = str(preferred_file)
     if not font_file and target_lang:
         for c in candidates:
             if target_lang in c.stem.lower():

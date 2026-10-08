@@ -8,3 +8,5 @@ jobs/
 *.sqlite3
 *.db
 .DS_Store
+.local-data/
+test video/

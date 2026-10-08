@@ -30,7 +30,7 @@ class Config:
     ffmpeg: str = 'ffmpeg'
     ffprobe: str = 'ffprobe'
     ocr_enabled: bool = True
-    ocr_provider: str = 'tesseract'
+    ocr_provider: str = 'gemini'
     ocr_language: str = 'eng'
     ocr_interval: float = 0.25
     ocr_region: str = ''

@@ -11,6 +11,7 @@ Uses:
   - Sync Labs active-speaker detection chooses the speaking face downstream
 """
 import json
+import os
 import cv2
 import numpy as np
 import subprocess
@@ -28,6 +29,10 @@ AROLL_THRESHOLD = 0.70   # SFace cosine similarity ≥ this → target speaker p
 REJECT_THRESHOLD = 0.40  # Below this → definitely not the target speaker
 MOTION_THRESHOLD = 4.0   # Mouth motion score above this → speaker is talking
 MIN_FACE_HEIGHT_RATIO = 0.10  # Ignore tiny background/inset face detections
+MAX_HEAD_YAW_DEG = float(os.getenv("LIPSYNC_MAX_HEAD_YAW_DEG", "28"))
+MAX_HEAD_PITCH_DEG = float(os.getenv("LIPSYNC_MAX_HEAD_PITCH_DEG", "20"))
+MAX_AWAY_FACE_RATIO = float(os.getenv("LIPSYNC_MAX_AWAY_FACE_RATIO", "0.4"))
+CLASSIFY_WINDOW_SEC = float(os.getenv("LIPSYNC_CLASSIFY_WINDOW_SEC", "0.5"))
 
 
 class SceneClassifier:
@@ -76,8 +81,9 @@ class SceneClassifier:
             probe_times = [target_time, target_time + 0.5, target_time - 0.5]
         else:
             dur = total / fps
-            probe_times = [dur * 0.2, dur * 0.35, dur * 0.5, dur * 0.65]
+            probe_times = [dur * fraction for fraction in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)]
 
+        candidates = []
         for t in probe_times:
             if t < 0:
                 continue
@@ -106,13 +112,20 @@ class SceneClassifier:
                 selected = max(faces, key=lambda f: f[2] * f[3])
 
             aligned = self.recognizer.alignCrop(frame, selected)
-            self.anchor_embedding = self.recognizer.feature(aligned)
+            embedding = self.recognizer.feature(aligned)
             box = [int(v) for v in selected[:4]]
-            cap.release()
-            print(f"[Classifier] Anchor set from t={t:.2f}s, face box={box}")
-            return box
+            angles = self._head_angles(frame, selected)
+            pose_cost = abs(angles[0]) + abs(angles[1]) if angles else 180.0
+            area = float(selected[2] * selected[3])
+            candidates.append((pose_cost, -area, t, embedding, box, angles))
 
         cap.release()
+        if candidates:
+            _, _, t, embedding, box, angles = min(candidates, key=lambda item: (item[0], item[1]))
+            self.anchor_embedding = embedding
+            pose_text = f", head pose={angles[0]:.0f}/{angles[1]:.0f} deg" if angles else ""
+            print(f"[Classifier] Camera-facing anchor set from t={t:.2f}s{pose_text}, face box={box}")
+            return box
         print("[Classifier] Warning: could not set identity anchor — will classify by motion only.")
         return None
 
@@ -142,6 +155,37 @@ class SceneClassifier:
         return float(self.recognizer.match(
             self.anchor_embedding, embedding, cv2.FaceRecognizerSF_FR_COSINE
         ))
+
+    @staticmethod
+    def _head_angles(frame: np.ndarray, face: np.ndarray) -> tuple[float, float] | None:
+        """Estimate head yaw and pitch from YuNet's five facial landmarks."""
+        try:
+            h, w = frame.shape[:2]
+            image_points = np.asarray(face[4:14], dtype=np.float64).reshape(5, 2)
+            model_points = np.asarray([
+                [-30.0, 30.0, -30.0], [30.0, 30.0, -30.0],
+                [0.0, 0.0, 0.0], [-25.0, -30.0, -20.0],
+                [25.0, -30.0, -20.0],
+            ], dtype=np.float64)
+            focal = float(max(w, h))
+            camera = np.asarray(
+                [[focal, 0, w / 2], [0, focal, h / 2], [0, 0, 1]],
+                dtype=np.float64,
+            )
+            ok, rotation, _ = cv2.solvePnP(
+                model_points, image_points, camera, np.zeros((4, 1)),
+                flags=cv2.SOLVEPNP_SQPNP,
+            )
+            if not ok:
+                return None
+            matrix, _ = cv2.Rodrigues(rotation)
+            forward = matrix @ np.asarray([0.0, 0.0, 1.0])
+            depth = abs(forward[2])
+            yaw = np.degrees(np.arctan2(forward[0], depth))
+            pitch = np.degrees(np.arctan2(forward[1], depth))
+            return float(yaw), float(pitch)
+        except (cv2.error, ValueError, TypeError):
+            return None
 
     def _sample_frames(self, video_path: Path, start_s: float, end_s: float,
                         n_samples: int = 8) -> list[np.ndarray]:
@@ -201,23 +245,19 @@ class SceneClassifier:
         motion = self._mouth_motion_score(frames)
 
         if not self._has_models or self.anchor_embedding is None:
-            # Fallback: classify by motion only
-            label = "A_ROLL" if motion >= MOTION_THRESHOLD else "B_ROLL"
             return {
-                "class": label,
+                "class": "B_ROLL",
                 "similarity": -1.0,
                 "motion": round(motion, 2),
                 "face_coords": None,
-                "reason": f"Motion-only: score={motion:.2f}",
+                "camera_facing": None,
+                "reason": "Face identity/head-pose models unavailable; preserving original footage",
             }
 
-        # Detect a meaningful face. Identity and local motion are retained as
-        # diagnostics, but do not gate lip-sync: the dubbed speech can start or
-        # end inside a shot, and Sync Labs performs active-speaker detection on
-        # the submitted clip more reliably than a single local identity anchor.
         best_sim = -1.0
         best_coords = None
-        largest_face_ratio = 0.0
+        pose_count = 0
+        away_count = 0
         for frame in frames:
             h, w = frame.shape[:2]
             self.detector.setInputSize((w, h))
@@ -225,31 +265,45 @@ class SceneClassifier:
             if faces is None:
                 continue
             for face in faces:
-                face_ratio = float(face[3]) / float(h)
-                if face_ratio > largest_face_ratio:
-                    largest_face_ratio = face_ratio
-                    best_coords = [int(v) for v in face[:4]]
                 aligned = self.recognizer.alignCrop(frame, face)
                 emb = self.recognizer.feature(aligned)
                 sim = self._similarity(emb)
+                if sim >= REJECT_THRESHOLD:
+                    angles = self._head_angles(frame, face)
+                    if angles is not None:
+                        pose_count += 1
+                        yaw, pitch = angles
+                        if abs(yaw) > MAX_HEAD_YAW_DEG or abs(pitch) > MAX_HEAD_PITCH_DEG:
+                            away_count += 1
                 if sim > best_sim:
                     best_sim = sim
+                    best_coords = [int(v) for v in face[:4]]
 
-        if largest_face_ratio >= MIN_FACE_HEIGHT_RATIO:
+        away_ratio = away_count / pose_count if pose_count else 0.0
+        if best_sim >= AROLL_THRESHOLD and pose_count and away_ratio > MAX_AWAY_FACE_RATIO:
+            label = "B_ROLL"
+            reason = (f"Target head is off-axis in {away_ratio:.0%} of samples; "
+                      "preserving original footage")
+        elif best_sim >= AROLL_THRESHOLD and motion >= MOTION_THRESHOLD:
             label = "A_ROLL"
-            reason = (f"Speech overlaps meaningful face (height={largest_face_ratio:.2f}, "
-                      f"sim={best_sim:.2f}); Sync Labs will detect active speaker")
+            reason = f"Target speaker confirmed (sim={best_sim:.2f}, motion={motion:.2f})"
+        elif best_sim >= AROLL_THRESHOLD:
+            label = "B_ROLL"
+            reason = f"Target face visible but not speaking (motion={motion:.2f})"
+        elif best_sim >= REJECT_THRESHOLD:
+            label = "B_ROLL"
+            reason = f"Uncertain face (sim={best_sim:.2f}); preserving original footage"
         else:
             label = "B_ROLL"
-            reason = (f"No meaningful face (largest height={largest_face_ratio:.2f}, "
-                      f"sim={best_sim:.2f})")
+            reason = f"Non-target face or no face (sim={best_sim:.2f})"
 
         return {
             "class": label,
             "similarity": round(best_sim, 3),
             "motion": round(motion, 2),
             "face_coords": best_coords,
-            "face_height_ratio": round(largest_face_ratio, 3),
+            "camera_facing": (away_ratio <= MAX_AWAY_FACE_RATIO) if pose_count else None,
+            "head_away_ratio": round(away_ratio, 3),
             "reason": reason,
         }
 
@@ -270,9 +324,22 @@ class SceneClassifier:
         for i, scene in enumerate(scenes):
             start_s = scene["start"]
             end_s = scene["end"]
-            result = self.classify_shot(video_path, start_s, end_s, speech_intervals)
-            enriched = {**scene, **result}
-            results.append(enriched)
+            window = max(0.25, CLASSIFY_WINDOW_SEC)
+            t = start_s
+            while t < end_s - 1e-4:
+                window_end = min(end_s, t + window)
+                result = self.classify_shot(video_path, t, window_end, speech_intervals)
+                enriched = {**scene, "start": t, "end": window_end, **result}
+                if (results and results[-1]["class"] == enriched["class"]
+                        and abs(results[-1]["end"] - t) < 0.02):
+                    results[-1]["end"] = window_end
+                    old_ratio = results[-1].get("head_away_ratio")
+                    new_ratio = enriched.get("head_away_ratio")
+                    if old_ratio is not None and new_ratio is not None:
+                        results[-1]["head_away_ratio"] = round((old_ratio + new_ratio) / 2, 3)
+                else:
+                    results.append(enriched)
+                t = window_end
             print(f"[Classifier] Shot {i:02d} [{start_s:.2f}s-{end_s:.2f}s] → "
                   f"{result['class']} | {result['reason']}")
         return results

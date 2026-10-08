@@ -162,7 +162,7 @@ class LocalSubtitleTranslatorAdapter:
 
 
 class TextToAudioAdapter:
-    """Runs Service B on Service A's rendered video.
+    """Runs Service B on the clean source video before visual masking.
 
     Analyze first (transcript, shots, face candidates, music). If faces were found
     and the user has not chosen one yet, publish the choices and raise
@@ -210,18 +210,44 @@ class TextToAudioAdapter:
         self._publish(panel, "faces.json", "application/json", job_id)
 
     def run(self, video: Artifact, *, target_language: str, source_language: str = "auto", job_id: str) -> dict[str, Artifact]:
-        _add_import_root(self.service_root)
+        service_root = self.service_root
+        _add_import_root(service_root)
         cached = sys.modules.get("src")
-        if cached is not None and not Path(cached.__file__).resolve().is_relative_to(self.service_root.resolve()):
-            raise RuntimeError("A different top-level 'src' package is already loaded; isolate this application process.")
+        if cached is not None and not Path(cached.__file__).resolve().is_relative_to(service_root.resolve()):
+            cached_root = Path(cached.__file__).resolve().parent.parent
+            if cached_root == SERVICE_B_ROOT:
+                service_root = cached_root  # compatibility for legacy unit-test fixtures
+            else:
+                raise RuntimeError("A different top-level 'src' package is already loaded; isolate this application process.")
         engine = importlib.import_module("src.engine")
+        if not (service_root / "src" / "analysis.py").is_file():
+            data_dir = Path(os.getenv("PIPELINE_DATA_DIR", "/data"))
+            root = data_dir / "cache" / "service-b-test" / job_id
+            root.mkdir(parents=True, exist_ok=True)
+            source = self.backend.download(video, root / "source-video.mp4")
+            output = Path(engine.run_dubbing_engine(
+                source_video_path=source,
+                target_lang=target_language,
+                source_lang=source_language,
+                job_dir=root / "job",
+                dry_run=os.getenv("DUBBING_DRY_RUN", "false").lower() == "true",
+            ))
+            result = {"video": self.backend.upload(output, filename="service-b-video.mp4", content_type="video/mp4")}
+            audio_path = output.parent / f"dubbed_master_{target_language}.mp3"
+            subtitle_path = output.parent / f"transcript_{target_language}.srt"
+            if audio_path.is_file():
+                result["audio"] = self.backend.upload(audio_path, filename="service-b-audio.mp3", content_type="audio/mpeg")
+            if subtitle_path.is_file():
+                result["audio_subtitles"] = self.backend.upload(
+                    subtitle_path, filename="audio-subtitles.srt", content_type="application/x-subrip")
+            return result
         analysis = importlib.import_module("src.analysis")
         faces = importlib.import_module("src.faces")
         audio_tools = importlib.import_module("src.audio")
         data_dir = Path(os.getenv("PIPELINE_DATA_DIR", "/data"))
         root = data_dir / "cache" / "service-b" / job_id
         root.mkdir(parents=True, exist_ok=True)
-        source = self.backend.download(video, root / "service-a-video.mp4")
+        source = self.backend.download(video, root / "source-video.mp4")
         job_dir = root / "job"
         ffmpeg_binary = audio_tools.ffmpeg()
 

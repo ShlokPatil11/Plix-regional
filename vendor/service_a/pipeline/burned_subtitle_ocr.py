@@ -367,8 +367,6 @@ class GeminiVideoSubtitleExtractor:
 
 def extract_burned(video, metadata, config, provider=None):
     if not config.ocr_enabled: raise RuntimeError('No text subtitle stream. Enable OCR_ENABLED and install OCR dependencies.')
-    try: import cv2
-    except ImportError as exc: raise RuntimeError('Install requirements-ocr.txt for burned-in subtitle OCR.') from exc
     import logging
     target_box = getattr(config, 'ocr_target_box', '').lower()
     # Agent runs first when requested — it produces accurate per-segment bboxes
@@ -381,14 +379,20 @@ def extract_burned(video, metadata, config, provider=None):
                 return agent_segs
         except Exception as exc:
             logging.getLogger(__name__).warning('AgentCardDetector failed, falling back to Gemini OCR: %s', exc)
-    if config.ocr_provider == 'gemini':
-        try:
-            extractor = GeminiVideoSubtitleExtractor(config)
-            gemini_segs = extractor.extract_subtitles(video, metadata)
-            if gemini_segs:
-                return gemini_segs
-        except Exception as exc:
-            logging.getLogger(__name__).warning('GeminiVideoSubtitleExtractor failed, falling back to Tesseract: %s', exc)
+    # Burned-subtitle masking is intentionally Gemini-only. A local OCR fallback can
+    # return plausible text with an incorrect bounding box, which produces a bad mask.
+    # Fail the job instead so an inaccurate Tesseract result is never rendered.
+    try:
+        extractor = GeminiVideoSubtitleExtractor(config)
+        gemini_segs = extractor.extract_subtitles(video, metadata)
+        if gemini_segs:
+            return gemini_segs
+    except Exception as exc:
+        raise RuntimeError(f'Gemini Vision subtitle detection failed: {exc}') from exc
+    raise RuntimeError('Gemini Vision found no burned subtitle segments; masking was stopped.')
+
+    # Legacy local-OCR implementation retained below for reference, but deliberately
+    # unreachable while Gemini-only masking is enabled.
     if provider is None:
         if config.ocr_provider not in ('tesseract', 'gemini'): raise ValueError('Unsupported OCR_PROVIDER; implement OCRProvider for another engine')
         provider=TesseractOCRProvider(config.ocr_language)

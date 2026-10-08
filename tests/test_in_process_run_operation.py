@@ -48,6 +48,31 @@ def test_dubbing_run_operation_mixes_music_and_publishes_the_artifacts(tmp_path,
     assert mean_volume_db(final) > mean_volume_db(voice) + 0.5
 
 
+def test_combine_mixes_detected_music_and_keeps_voice_master_for_slider(tmp_path, monkeypatch):
+    monkeypatch.setattr(in_process, "TextToAudioAdapter", make_fake_adapter(tmp_path))
+    backend = FileArtifactBackend(tmp_path / "art")
+    source = backend.upload(make_video(tmp_path / "in.mp4"), filename="in.mp4", content_type="video/mp4")
+    captions = tmp_path / "captions.srt"
+    captions.write_text("1\n00:00:00,000 --> 00:00:01,000\nHi\n", encoding="utf-8")
+    monkeypatch.setattr(in_process, "_run_clean_stage", lambda *args, **kwargs: {
+        "final_video": source,
+        "clean_video": source,
+        "translated_captions": backend.upload(
+            captions, filename="translated-captions.srt", content_type="application/x-subrip"
+        ),
+    })
+
+    artifacts = in_process.run_operation(
+        source, operation="combine", target_language="hi", backend=backend, job_id="job1"
+    )
+
+    for name in ("final_video", "voice_video", "music_track", "music_info"):
+        assert name in artifacts
+    assert mean_volume_db(artifacts["final_video"].metadata["path"]) > (
+        mean_volume_db(artifacts["voice_video"].metadata["path"]) + 0.5
+    )
+
+
 def test_dubbing_with_a_corrupt_music_track_completes_voice_only(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(in_process, "TextToAudioAdapter", make_fake_adapter(tmp_path, corrupt_music=True))
     backend = FileArtifactBackend(tmp_path / "art")

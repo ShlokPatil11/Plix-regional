@@ -19,6 +19,7 @@ services:
       ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
       SYNC_API_KEY: ${SYNC_API_KEY:-}
       SYNC_MODEL: ${SYNC_MODEL:-lipsync-2-pro}
+      FULL_VIDEO_SYNC: ${FULL_VIDEO_SYNC:-true}
     volumes:
       - directory-language-data:/data
 

@@ -9,7 +9,7 @@
     * { box-sizing: border-box; }
     body { min-height: 100vh; margin: 0; background: #fff; }
     .shell { width: 100%; min-height: 100vh; background: #fff; }
-    .topbar { height: 82px; display: flex; align-items: center; padding: 0 40px; background: #050505; }
+    .topbar { position: sticky; top: 0; z-index: 100; height: 82px; display: flex; align-items: center; padding: 0 40px; background: #050505; }
     .brand { display: flex; align-items: center; }
     .brand img { display: block; width: 184px; height: auto; }
     .top-nav { display: flex; align-items: center; gap: clamp(24px, 3vw, 48px); margin-left: auto; }
@@ -41,8 +41,10 @@
     .upload-field input[type="file"] { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
     .file-name { display: block; max-width: 340px; margin: -6px auto 0; overflow: hidden; color: #666; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
     .workflow-note { margin: 0; padding: 14px 16px; color: #777; font-size: 12px; border-left: 3px solid var(--lime); background: #f5f5f5; }
-    .actions { display: grid; grid-template-columns: repeat(2, minmax(88px, 110px)) minmax(120px, 145px); justify-content: center; gap: 7px; }
+    .actions { display: grid; grid-template-columns: repeat(2, minmax(88px, 110px)); justify-content: center; gap: 7px; }
     .actions button { min-height: 38px; padding: 7px 12px; font-size: 12px; }
+    .provider-status { display: flex; align-items: center; justify-content: center; gap: 10px; color: #666; font-size: 12px; }
+    .provider-status a { padding: 6px 10px; border: 1px solid #d7d7d7; color: #111; text-decoration: none; background: #fff; }
     button { min-height: 54px; padding: 12px 18px; border: 1px solid var(--lime); border-radius: 0; color: #111; background: var(--lime); cursor: pointer; font-weight: 650; transition: background .18s, color .18s, transform .18s; }
     button:hover:not(:disabled) { background: #111; border-color: #111; color: #fff; transform: translateY(-1px); }
     button.secondary { border-color: #d7d7d7; background: #eee; }
@@ -106,7 +108,8 @@
       <label>Target language<select name="target_language" id="target" required></select></label>
       <label>Source language<input name="source_language" value="auto" placeholder="Auto-detect, en, hi…"></label>
     </div>
-    <p class="workflow-note">Masking preserves the original visuals. Dubbing translates the voice. Combine runs the full lip-synced localization workflow.</p>
+    <p class="workflow-note">Masking runs Wan 3.0 cleanup, stitching, and translated captions. Dubbing runs the new Service B. Combine runs Masking first, then Service B on the clean captioned video.</p>
+    <div class="provider-status" id="magnific-status">Checking Magnific connection…</div>
     <div class="actions">
       <button type="submit" name="operation" value="masking" class="secondary">Masking</button>
       <button type="submit" name="operation" value="dubbing" class="secondary">Dubbing</button>
@@ -124,6 +127,7 @@ const result = document.querySelector('#result');
 const buttons = [...form.querySelectorAll('button[type="submit"]')];
 const videoInput = form.querySelector('input[name="file"]');
 const fileName = document.querySelector('#file-name');
+const magnificStatus = document.querySelector('#magnific-status');
 const isFilePreview = location.protocol === 'file:';
 videoInput.addEventListener('change', () => {
   const selected = videoInput.files[0];
@@ -145,12 +149,22 @@ async function loadLanguages() {
     buttons.forEach(button => button.disabled = true);
   }
 }
+async function loadMagnificStatus() {
+  try {
+    const response = await fetch('/api/magnific/status');
+    const data = await response.json();
+    if (data.connected) { magnificStatus.textContent = 'Magnific connected · Wan 3.0 ready'; return; }
+    const link = document.createElement('a'); link.href = '/api/magnific/connect'; link.textContent = 'Connect Magnific';
+    magnificStatus.replaceChildren(document.createTextNode('Magnific is required for AI caption cleanup.'), link);
+  } catch (_) { magnificStatus.textContent = 'Could not check Magnific connection.'; }
+}
 if (isFilePreview) {
   result.classList.add('preview-notice');
   result.textContent = 'Preview mode: start the FastAPI app and open its local URL to load languages and process videos.';
   buttons.forEach(button => button.disabled = true);
 } else {
   loadLanguages();
+  loadMagnificStatus();
 }
 
 async function renderFacePanel(jobId, resume) {
@@ -284,7 +298,7 @@ function startPolling(jobId) {
     if (job.status === 'awaiting_face_selection') { await renderFacePanel(jobId, poll); return; }
     if (job.status === 'completed') {
       const links = document.createElement('div'); links.className = 'links';
-      const labels = {final_video:'Processed video',visual_subtitles:'Visual subtitles',audio_subtitles:'Audio subtitles',masking_video:'Masking video',dubbed_video:'Dubbed video',service_a_video:'Service A video',service_b_video:'Service B video',service_b_audio:'Dubbed audio',voice_video:'Voice-only video',music_track:'Music track',music_info:'Music info'};
+      const labels = {final_video:'Processed video',visual_subtitles:'Visual subtitles',translated_captions:'Translated captions',clean_video:'Clean stitched video',audio_subtitles:'Audio subtitles',masking_video:'Masking video',dubbed_video:'Dubbed video',service_a_video:'Service A video',service_b_video:'Service B video',service_b_audio:'Dubbed audio',voice_video:'Voice-only video',music_track:'Music track',music_info:'Music info'};
       for (const [name, url] of Object.entries(job.artifacts)) {
         const link = document.createElement('a'); link.href = url; link.textContent = labels[name] || name.replaceAll('_',' '); link.download = ''; links.append(link);
       }

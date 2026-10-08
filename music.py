@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, replace
@@ -158,6 +159,14 @@ class ShazamIdentifier:
     """
 
     async def _recognize(self, clip: Path) -> dict:
+        # macOS framework Python may not inherit a usable system CA bundle.
+        # shazamio/aiohttp honors SSL_CERT_FILE when creating its SSL context.
+        if not os.environ.get("SSL_CERT_FILE"):
+            try:
+                import certifi
+                os.environ["SSL_CERT_FILE"] = certifi.where()
+            except ImportError:
+                pass
         from shazamio import Shazam
 
         shazam = Shazam()

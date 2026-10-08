@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIPELINE_DATA_DIR=/data
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg tesseract-ocr libgl1 libglib2.0-0 \
+    ffmpeg tesseract-ocr libgl1 libglib2.0-0 fonts-noto-core pango1.0-tools \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

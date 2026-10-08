@@ -70,7 +70,8 @@ def _words_to_srt(words: list[dict]) -> str:
         ms = int(round((secs % 1) * 1000))
         return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-    # Group words into sentences by gaps > 0.5s or punctuation
+    # Group words into readable cues. Some multilingual Whisper output has no
+    # recognized sentence punctuation, so also cap cue length and duration.
     groups = []
     current: list[dict] = []
     for w in words:
@@ -78,7 +79,8 @@ def _words_to_srt(words: list[dict]) -> str:
             gap = w["start"] - current[-1]["end"]
             text = current[-1]["word"]
             ends_sentence = text.endswith((".", "!", "?", "।"))
-            if gap > 0.6 or ends_sentence:
+            duration = current[-1]["end"] - current[0]["start"]
+            if gap > 0.6 or ends_sentence or len(current) >= 10 or duration >= 4.5:
                 groups.append(current)
                 current = []
         current.append(w)
