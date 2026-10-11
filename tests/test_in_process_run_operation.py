@@ -73,6 +73,47 @@ def test_combine_mixes_detected_music_and_keeps_voice_master_for_slider(tmp_path
     )
 
 
+def test_masking_overlay_uses_service_a_instead_of_wan_cleanup(tmp_path, monkeypatch):
+    backend = FileArtifactBackend(tmp_path / "art")
+    source = backend.upload(make_video(tmp_path / "in.mp4"), filename="in.mp4", content_type="video/mp4")
+    captions = tmp_path / "captions.srt"
+    captions.write_text("1\n00:00:00,000 --> 00:00:01,000\nHi\n", encoding="utf-8")
+
+    class FakeOverlayAdapter:
+        def __init__(self, selected_backend):
+            self.backend = selected_backend
+
+        def run(self, video, **kwargs):
+            return {"video": video, "visual_subtitles": self.backend.upload(
+                captions, filename="visual-subtitles.srt", content_type="application/x-subrip"
+            )}
+
+    monkeypatch.setattr(in_process, "LocalSubtitleTranslatorAdapter", FakeOverlayAdapter)
+    monkeypatch.setattr(in_process, "_run_clean_stage", lambda *args, **kwargs: pytest.fail("WAN cleanup ran"))
+    artifacts = in_process.run_operation(
+        source, operation="masking", masking_mode="overlay",
+        target_language="hi", backend=backend, job_id="job1",
+    )
+    assert {"final_video", "masking_video", "service_a_video", "translated_captions"} <= artifacts.keys()
+
+
+def test_combine_overlay_uses_earlier_pipeline(tmp_path, monkeypatch):
+    backend = FileArtifactBackend(tmp_path / "art")
+    source = backend.upload(make_video(tmp_path / "in.mp4"), filename="in.mp4", content_type="video/mp4")
+    monkeypatch.setattr(in_process, "run_artifact", lambda *args, **kwargs: type("Result", (), {
+        "final_video": source, "service_a_video": source, "visual_subtitles": source,
+        "service_b_video": source, "service_b_audio": None, "audio_subtitles": None,
+        "music_track": None, "music_info": None,
+    })())
+    monkeypatch.setattr(in_process, "_run_clean_stage", lambda *args, **kwargs: pytest.fail("WAN cleanup ran"))
+    artifacts = in_process.run_operation(
+        source, operation="combine", masking_mode="overlay",
+        target_language="hi", backend=backend, job_id="job1",
+    )
+    assert artifacts["final_video"] is source
+    assert artifacts["masking_video"] is source
+
+
 def test_dubbing_with_a_corrupt_music_track_completes_voice_only(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(in_process, "TextToAudioAdapter", make_fake_adapter(tmp_path, corrupt_music=True))
     backend = FileArtifactBackend(tmp_path / "art")

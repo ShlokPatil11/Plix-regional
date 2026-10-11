@@ -7,10 +7,48 @@ Cache key: sha256 of first 2MB of video file (fast, deterministic, avoids re-tra
 import hashlib
 import json
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 
 from .common import PipelineError
 from .srt_parser import parse_srt
+
+
+@lru_cache(maxsize=1)
+def _whisper_model():
+    from faster_whisper import WhisperModel  # noqa: PLC0415
+
+    return WhisperModel("base", compute_type="int8")
+
+
+def detect_language(video_path: Path, work_dir: Path) -> dict:
+    """Quickly detect the spoken language from at most the first 30 seconds."""
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    sample = work_dir / "language-sample.wav"
+    command = [
+        "ffmpeg", "-y", "-nostdin", "-i", str(Path(video_path).resolve()),
+        "-t", "30", "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+        str(sample),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode:
+        raise PipelineError(f"Audio extraction for language detection failed: {result.stderr}")
+    try:
+        segments, info = _whisper_model().transcribe(
+            str(sample), beam_size=1, vad_filter=True, condition_on_previous_text=False
+        )
+        # Consume one segment so faster-whisper performs detection and verifies
+        # that the sample contains usable speech.
+        first = next(iter(segments), None)
+        if first is None:
+            raise PipelineError("No speech was found in the first 30 seconds.")
+        return {
+            "code": info.language,
+            "probability": float(info.language_probability),
+        }
+    finally:
+        sample.unlink(missing_ok=True)
 
 
 def _video_hash(video_path: Path, chunk_size: int = 2 * 1024 * 1024) -> str:
@@ -43,9 +81,7 @@ def _transcribe_with_faster_whisper(audio_path: Path, source_lang: str = None) -
     Returns list of word dicts: {word, start, end}.
     Raises ImportError if faster-whisper is not installed.
     """
-    from faster_whisper import WhisperModel  # noqa: PLC0415
-
-    model = WhisperModel("base", compute_type="int8")
+    model = _whisper_model()
     lang = None if not source_lang or source_lang == "auto" else source_lang
     segments, _ = model.transcribe(str(audio_path), language=lang, word_timestamps=True)
 

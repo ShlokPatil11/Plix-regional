@@ -24,6 +24,7 @@ class JobStore:
                 target_language TEXT NOT NULL,
                 source_language TEXT NOT NULL,
                 operation TEXT NOT NULL DEFAULT 'combine',
+                masking_mode TEXT NOT NULL DEFAULT 'new',
                 input_path TEXT NOT NULL,
                 input_name TEXT NOT NULL,
                 artifacts TEXT NOT NULL DEFAULT '{}',
@@ -36,6 +37,8 @@ class JobStore:
             columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
             if "operation" not in columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN operation TEXT NOT NULL DEFAULT 'combine'")
+            if "masking_mode" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN masking_mode TEXT NOT NULL DEFAULT 'new'")
             if "face_choice" not in columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN face_choice TEXT")
             if "awaiting_since" not in columns:
@@ -56,12 +59,13 @@ class JobStore:
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def create(self, job_id: str, target: str, source: str, input_path: Path, input_name: str, operation: str = "combine") -> None:
+    def create(self, job_id: str, target: str, source: str, input_path: Path, input_name: str,
+               operation: str = "combine", masking_mode: str = "new") -> None:
         now = self._now()
         with self._lock, self._connect() as db:
             db.execute(
-                "INSERT INTO jobs(job_id,status,stage,target_language,source_language,operation,input_path,input_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (job_id, "queued", "queued", target, source, operation, str(input_path), input_name, now, now),
+                "INSERT INTO jobs(job_id,status,stage,target_language,source_language,operation,masking_mode,input_path,input_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (job_id, "queued", "queued", target, source, operation, masking_mode, str(input_path), input_name, now, now),
             )
         self._write_manifest(job_id)
 
@@ -175,6 +179,20 @@ class JobStore:
         result["artifacts"] = json.loads(result["artifacts"])
         return result
 
+    def list(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return persisted jobs newest first for the queue/history dashboard."""
+        limit = max(1, min(int(limit), 500))
+        with self._lock, self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        jobs = []
+        for row in rows:
+            record = dict(row)
+            record["artifacts"] = json.loads(record["artifacts"])
+            jobs.append(record)
+        return jobs
+
     def _write_manifest(self, job_id: str) -> None:
         record = self.get(job_id)
         if record is None:
@@ -188,6 +206,7 @@ class JobStore:
             "target_language": record["target_language"],
             "source_language": record["source_language"],
             "operation": record["operation"],
+            "masking_mode": record["masking_mode"],
             "input": record["input_name"],
             "artifacts": {
                 name: f"/api/jobs/{job_id}/artifacts/{name}"

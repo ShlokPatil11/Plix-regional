@@ -171,7 +171,10 @@ class ClaudeTranslationProvider(TranslationProvider):
 class GeminiTranslationProvider(TranslationProvider):
     def __init__(self, config, client=None):
         self.config = config
-        self.model = config.gemini_model or config.model or 'gemini-2.5-flash'
+        configured = config.gemini_model or config.model or 'gemini-3.5-flash-lite'
+        # TRANSLATION_MODEL was historically shared with other providers. Do
+        # not send an OpenAI/Groq model identifier to the Gemini endpoint.
+        self.model = configured if not configured.startswith(('openai/', 'groq/')) else 'gemini-3.5-flash-lite'
         if client is None:
             api_key = config.gemini_api_key or os.getenv('GEMINI_API_KEY')
             if not api_key:
@@ -182,6 +185,37 @@ class GeminiTranslationProvider(TranslationProvider):
                 timeout=round(config.api_timeout*1000),
                 retry_options=types.HttpRetryOptions(attempts=1)))
         self.client = client
+
+    @staticmethod
+    def _translate_with_luna(system, data, schema):
+        """Final translation fallback when every Gemini candidate is unavailable."""
+        import requests
+
+        api_key = (os.getenv('OPENAI_API_KEY') or '').strip()
+        if not api_key:
+            raise ValueError('All Gemini translation models failed and OPENAI_API_KEY is not set for Luna fallback.')
+        strict_schema = dict(schema)
+        strict_schema['additionalProperties'] = False
+        strict_schema['properties']['segments']['items']['additionalProperties'] = False
+        response = requests.post(
+            'https://api.openai.com/v1/chat/completions',
+            headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+            json={
+                'model': os.getenv('OPENAI_FALLBACK_MODEL', 'gpt-6-luna'),
+                'reasoning_effort': 'none',
+                'messages': [
+                    {'role': 'system', 'content': system},
+                    {'role': 'user', 'content': json.dumps(data, ensure_ascii=False)},
+                ],
+                'response_format': {
+                    'type': 'json_schema',
+                    'json_schema': {'name': 'subtitle_translations', 'strict': True, 'schema': strict_schema},
+                },
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        return json.loads(response.json()['choices'][0]['message']['content'])
 
     def translate_segments(self, segments, source_language, target_language, context, concise=False):
         from google.genai import types
@@ -227,25 +261,31 @@ class GeminiTranslationProvider(TranslationProvider):
             response_json_schema=schema,
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
-        try:
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents=json.dumps(data, ensure_ascii=False),
-                config=gen_config,
-            )
-        except Exception as exc:
-            fallback_model = 'gemini-3.5-flash' if self.model == 'gemini-2.5-flash' else 'gemini-2.5-flash'
+        errors = []
+        candidates = list(dict.fromkeys((self.model, 'gemini-3.5-flash-lite', 'gemini-3.8-flash')))
+        payload = None
+        for candidate in candidates:
             try:
                 response = self.client.models.generate_content(
-                    model=fallback_model,
+                    model=candidate,
                     contents=json.dumps(data, ensure_ascii=False),
                     config=gen_config,
                 )
-            except Exception:
-                raise exc
-        if not response.text:
-            raise ValueError('Gemini returned an empty response')
-        payload = json.loads(response.text)
+                if not response.text:
+                    raise ValueError(f'{candidate} returned an empty response')
+                payload = json.loads(response.text)
+                break
+            except Exception as exc:
+                errors.append(exc)
+        if payload is None:
+            try:
+                payload = self._translate_with_luna(system, data, schema)
+            except Exception as luna_error:
+                if errors:
+                    raise RuntimeError(
+                        f'All Gemini translation models failed; Luna fallback also failed: {luna_error}'
+                    ) from errors[-1]
+                raise
         seg_dict = {s.id: s.source_text for s in segments}
         returned_map = {}
         for entry in payload.get('segments', []):

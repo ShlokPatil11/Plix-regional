@@ -75,6 +75,7 @@ def run_operation(
     input_artifact: Artifact,
     *,
     operation: str,
+    masking_mode: str = "new",
     target_language: str,
     backend,
     source_language: str = "auto",
@@ -84,6 +85,27 @@ def run_operation(
 ) -> dict[str, Artifact]:
     """Run masking, dubbing, or both and publish only that operation's outputs."""
     job_id = job_id or "job"
+    if masking_mode not in {"overlay", "new"}:
+        raise ValueError(f"Unsupported masking mode: {masking_mode}")
+    if operation == "combine" and masking_mode == "overlay":
+        result = run_artifact(
+            input_artifact, target_language=target_language, source_language=source_language,
+            backend=backend, job_id=job_id, on_stage=on_stage, face_choice=face_choice,
+        )
+        artifacts = {
+            "final_video": result.final_video,
+            "masking_video": result.service_a_video,
+            "service_a_video": result.service_a_video,
+            "translated_captions": result.visual_subtitles,
+        }
+        for name, value in (
+            ("service_b_video", result.service_b_video), ("voice_video", result.service_b_video),
+            ("service_b_audio", result.service_b_audio), ("audio_subtitles", result.audio_subtitles),
+            ("music_track", result.music_track), ("music_info", result.music_info),
+        ):
+            if value is not None:
+                artifacts[name] = value
+        return artifacts
     if operation == "combine":
         clean = _run_clean_stage(input_artifact, target_language, backend, job_id, on_stage)
         if on_stage:
@@ -114,6 +136,21 @@ def run_operation(
         return artifacts
 
     if operation == "masking":
+        if masking_mode == "overlay":
+            if on_stage:
+                on_stage("service_a_running")
+            output = LocalSubtitleTranslatorAdapter(backend).run(
+                input_artifact, target_language=target_language,
+                source_language=source_language, job_id=job_id,
+            )
+            video = backend.publish(output["video"], name="masking_video.mp4", job_id=job_id)
+            captions = backend.publish(
+                output["visual_subtitles"], name="translated_captions.srt", job_id=job_id
+            )
+            if on_stage:
+                on_stage("masking_completed")
+            return {"final_video": video, "masking_video": video,
+                    "service_a_video": output["video"], "translated_captions": captions}
         output = _run_clean_stage(input_artifact, target_language, backend, job_id, on_stage)
         video = backend.publish(output["final_video"], name="masking_video.mp4", job_id=job_id)
         if on_stage:

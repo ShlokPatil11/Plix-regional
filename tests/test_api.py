@@ -152,3 +152,17 @@ def test_status_includes_music_info(api, tmp_path):
     completed_job(module, tmp_path)
     body = client.get("/api/jobs/j1").json()
     assert body["music"]["title"] == "Song"
+
+
+def test_jobs_endpoint_lists_queue_and_history(api, tmp_path):
+    module, client = api
+    new_job(module, tmp_path, job_id="j1")
+    new_job(module, tmp_path, job_id="j2")
+    module.store.finish("j2", {})
+
+    response = client.get("/api/jobs")
+    assert response.status_code == 200
+    jobs = {job["job_id"]: job for job in response.json()}
+    assert jobs["j1"]["status"] == "queued"
+    assert jobs["j2"]["status"] == "completed"
+    assert jobs["j1"]["input_name"] == "in.mp4"

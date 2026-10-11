@@ -72,6 +72,15 @@
     .custom-music { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
     .custom-music summary { cursor: pointer; font-weight: 650; }
     .custom-music input, .custom-music small { display: block; margin: 10px 0; }
+    .jobs-dashboard { margin-top: 34px; padding-top: 26px; border-top: 1px solid var(--line); }
+    .jobs-dashboard h2 { margin: 0 0 14px; font-size: 20px; font-weight: 500; }
+    .jobs-dashboard h3 { margin: 20px 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; }
+    .job-list { display: grid; gap: 8px; }
+    .job-card { width: 100%; min-height: 0; padding: 12px 14px; border: 1px solid var(--line); color: #111; background: #fafafa; text-align: left; font-weight: 400; }
+    .job-card:hover:not(:disabled), .job-card.selected { border-color: #111; color: #111; background: #f4ffe7; transform: none; }
+    .job-card strong, .job-card span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .job-card span { margin-top: 3px; color: var(--muted); font-size: 12px; }
+    .empty-jobs { margin: 0; font-size: 12px; }
     @media (max-width: 980px) { .topbar { height: 74px; padding: 0 26px; } .brand img { width: 158px; } .top-nav { gap: 20px; } .workspace { min-height: calc(100vh - 74px); grid-template-columns: 1fr; } .visual-panel { min-height: 590px; padding: 70px 42px; } .visual-copy { right: 42px; bottom: 55px; left: 42px; } main { min-height: 540px; padding: 80px 42px; } }
     @media (max-width: 620px) { .top-nav { display: none; } }
     @media (max-width: 560px) { .topbar { height: 66px; padding: 0 20px; } .brand img { width: 138px; } .visual-panel { min-height: 500px; padding: 60px 22px; } h1 { font-size: 55px; } .visual-copy { right: 22px; bottom: 42px; left: 22px; font-size: 16px; } main { min-height: 480px; padding: 65px 20px; } .upload-field { min-height: 82px; } .upload-label { font-size: 24px; } .field-grid { grid-template-columns: 1fr; } .actions { grid-template-columns: repeat(2, minmax(76px, 1fr)); } .actions button:last-child { grid-column: 1 / -1; } }
@@ -106,9 +115,13 @@
     <div class="form-options" id="form-options">
     <div class="field-grid">
       <label>Target language<select name="target_language" id="target" required></select></label>
-      <label>Source language<input name="source_language" value="auto" placeholder="Auto-detect, en, hi…"></label>
+      <label>Source language<input name="source_language" value="auto" placeholder="Auto-detect, en, hi…"><small id="detected-language">Select a video to detect its spoken language.</small></label>
+      <label>Masking method<select name="masking_mode" id="masking-mode">
+        <option value="new">New — remove captions and add translated text</option>
+        <option value="overlay">Overlay — cover existing text with translated text</option>
+      </select></label>
     </div>
-    <p class="workflow-note">Masking runs Wan 3.0 cleanup, stitching, and translated captions. Dubbing runs the new Service B. Combine runs Masking first, then Service B on the clean captioned video.</p>
+    <p class="workflow-note">Choose New for Wan 3.0 caption removal and replacement, or Overlay to cover the existing captions. This choice applies to Masking and Combine.</p>
     <div class="provider-status" id="magnific-status">Checking Magnific connection…</div>
     <div class="actions">
       <button type="submit" name="operation" value="masking" class="secondary">Masking</button>
@@ -117,6 +130,13 @@
     </div>
     </div>
   </form>
+  <section class="jobs-dashboard" id="jobs-dashboard" aria-live="polite">
+    <h2>Jobs</h2>
+    <h3>Queue &amp; processing</h3>
+    <div class="job-list" id="queue-list"><p class="empty-jobs">No videos queued.</p></div>
+    <h3>History</h3>
+    <div class="job-list" id="history-list"><p class="empty-jobs">No completed videos yet.</p></div>
+  </section>
   <section id="result" aria-live="polite"></section>
 </main>
   </div>
@@ -127,11 +147,31 @@ const result = document.querySelector('#result');
 const buttons = [...form.querySelectorAll('button[type="submit"]')];
 const videoInput = form.querySelector('input[name="file"]');
 const fileName = document.querySelector('#file-name');
+const detectedLanguage = document.querySelector('#detected-language');
 const magnificStatus = document.querySelector('#magnific-status');
+const queueList = document.querySelector('#queue-list');
+const historyList = document.querySelector('#history-list');
 const isFilePreview = location.protocol === 'file:';
-videoInput.addEventListener('change', () => {
+let selectedJobId = null;
+let pollingToken = 0;
+let languageDetectionToken = 0;
+videoInput.addEventListener('change', async () => {
   const selected = videoInput.files[0];
   fileName.textContent = selected ? selected.name : 'MP4, MOV, MKV, AVI or WebM';
+  const token = ++languageDetectionToken;
+  if (!selected) { detectedLanguage.textContent = 'Select a video to detect its spoken language.'; return; }
+  detectedLanguage.textContent = 'Detecting spoken language…';
+  const data = new FormData(); data.set('file', selected);
+  try {
+    const response = await fetch('/api/detect-language', {method: 'POST', body: data});
+    const result = await response.json();
+    if (token !== languageDetectionToken) return;
+    if (!response.ok) throw new Error(result.detail || 'Language detection failed');
+    const confidence = Math.round(Number(result.confidence) * 100);
+    detectedLanguage.textContent = `Detected: ${result.name} (${result.code}) · ${confidence}% confidence`;
+  } catch (error) {
+    if (token === languageDetectionToken) detectedLanguage.textContent = `Could not detect language: ${error.message}`;
+  }
 });
 async function loadLanguages() {
   try {
@@ -281,17 +321,22 @@ function customMusicSection(jobId, music, video, currentPercent, redraw) {
 }
 
 function startPolling(jobId) {
-  buttons.forEach(button => button.disabled = true);
+  selectedJobId = jobId;
+  const token = ++pollingToken;
+  history.replaceState(null, '', '?job=' + encodeURIComponent(jobId));
+  document.querySelectorAll('.job-card').forEach(card => card.classList.toggle('selected', card.dataset.jobId === jobId));
   const poll = async () => {
+    if (token !== pollingToken) return;
     let job;
     try {
       const statusResponse = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
-      if (!statusResponse.ok) { result.textContent = `Job ${jobId} was not found (it may have expired).`; buttons.forEach(button => button.disabled = false); return; }
+      if (!statusResponse.ok) { result.textContent = `Job ${jobId} was not found.`; return; }
       job = await statusResponse.json();
     } catch (error) { setTimeout(poll, 2500); return; }
+    if (token !== pollingToken) return;
     result.replaceChildren();
     const heading = document.createElement('p');
-    heading.textContent = `${job.operation}: ${job.status} · ${job.stage}`;
+    heading.textContent = `${job.input_name} · ${job.operation}: ${job.status} · ${job.stage}`;
     result.append(heading);
     const logLink = document.createElement('a'); logLink.href = job.log_url; logLink.textContent = 'View complete process log'; result.append(logLink);
     if (job.error) { const error = document.createElement('p'); error.textContent = job.error; result.append(error); }
@@ -306,12 +351,43 @@ function startPolling(jobId) {
       result.append(links);
       const video = document.createElement('video'); video.controls = true; video.src = job.artifacts.final_video; result.append(video);
       renderMusicPanel(jobId, job, video);
-      buttons.forEach(button => button.disabled = false); return;
+      return;
     }
-    if (job.status === 'failed') { buttons.forEach(button => button.disabled = false); return; }
+    if (job.status === 'failed') return;
     setTimeout(poll, 2500);
   };
   poll();
+}
+
+function renderJobList(container, jobs, emptyText) {
+  container.replaceChildren();
+  if (!jobs.length) {
+    const empty = document.createElement('p'); empty.className = 'empty-jobs'; empty.textContent = emptyText; container.append(empty); return;
+  }
+  for (const job of jobs) {
+    const card = document.createElement('button'); card.type = 'button'; card.className = 'job-card';
+    card.dataset.jobId = job.job_id;
+    if (job.job_id === selectedJobId) card.classList.add('selected');
+    const name = document.createElement('strong'); name.textContent = job.input_name;
+    const details = document.createElement('span');
+    const masking = ['masking', 'combine'].includes(job.operation) ? ` · ${job.masking_mode || 'new'}` : '';
+    details.textContent = `${job.operation}${masking} · ${job.status} · ${job.stage} · ${new Date(job.created_at).toLocaleString()}`;
+    card.append(name, details);
+    card.addEventListener('click', () => startPolling(job.job_id));
+    container.append(card);
+  }
+}
+
+async function refreshJobs() {
+  try {
+    const response = await fetch('/api/jobs');
+    if (!response.ok) return;
+    const jobs = await response.json();
+    const active = jobs.filter(job => !['completed', 'failed'].includes(job.status)).reverse();
+    const historyJobs = jobs.filter(job => ['completed', 'failed'].includes(job.status));
+    renderJobList(queueList, active, 'No videos queued or processing.');
+    renderJobList(historyList, historyJobs, 'No completed videos yet.');
+  } catch (_) {}
 }
 
 form.addEventListener('submit', async event => {
@@ -327,12 +403,19 @@ form.addEventListener('submit', async event => {
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Upload failed');
     result.textContent = `Job ${data.job_id}: queued`;
+    form.reset();
+    fileName.textContent = 'MP4, MOV, MKV, AVI or WebM';
+    buttons.forEach(button => button.disabled = false);
     startPolling(data.job_id);
-    history.replaceState(null, '', '?job=' + encodeURIComponent(data.job_id));
+    refreshJobs();
   } catch (error) { result.textContent = error.message; buttons.forEach(button => button.disabled = false); }
 });
 const resumeJobId = new URLSearchParams(location.search).get('job');
-if (resumeJobId && !isFilePreview) { result.textContent = `Resuming job ${resumeJobId}…`; startPolling(resumeJobId); }
+if (!isFilePreview) {
+  refreshJobs();
+  setInterval(refreshJobs, 2500);
+  if (resumeJobId) { result.textContent = `Resuming job ${resumeJobId}…`; startPolling(resumeJobId); }
+}
 </script>
 </body>
 </html>

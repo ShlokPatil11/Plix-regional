@@ -15,7 +15,7 @@ class Config:
     api_key: str = field(default='', repr=False)
     model: str = ''
     gemini_api_key: str = field(default='', repr=False)
-    gemini_model: str = 'gemini-2.5-flash'
+    gemini_model: str = 'gemini-3.5-flash-lite'
     groq_api_key: str = field(default='', repr=False)
     groq_model: str = 'openai/gpt-oss-120b'
     stability_seconds: float = 5

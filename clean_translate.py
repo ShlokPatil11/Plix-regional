@@ -185,7 +185,7 @@ def _pango_overlays(cues: list[dict], width: int, font_path: Path, root: Path) -
         path = root / f"caption-{index:04d}.png"
         command = [
             pango, "--no-display", "--backend=cairo", "--pixels",
-            "--background=transparent", "--foreground=#ffffffff",
+            "--background=#000000ff", "--foreground=#ffffffff",
             "--align=center", "--wrap=word-char", f"--width={round(width * 0.86)}",
             "--margin=0", "--spacing=4", "--font", f"{family} SemiBold 38",
             "--text", str(cue["text"]), "--output", str(path),

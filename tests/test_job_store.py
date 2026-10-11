@@ -80,3 +80,23 @@ def test_old_databases_are_migrated(tmp_path):
     store = JobStore(path)
     store.create("j1", "hi", "auto", tmp_path / "i.mp4", "i.mp4")
     assert store.get("j1")["face_choice"] is None
+    assert store.get("j1")["masking_mode"] == "new"
+
+
+def test_masking_mode_is_persisted(tmp_path):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    store.create("j1", "hi", "auto", tmp_path / "i.mp4", "i.mp4", "masking", "overlay")
+
+    assert store.get("j1")["masking_mode"] == "overlay"
+    assert store.claim()["masking_mode"] == "overlay"
+
+
+def test_list_returns_persisted_jobs_newest_first(tmp_path):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    store.create("j1", "hi", "auto", tmp_path / "one.mp4", "one.mp4")
+    time.sleep(0.01)
+    store.create("j2", "ta", "en", tmp_path / "two.mp4", "two.mp4", "dubbing")
+
+    assert [job["job_id"] for job in store.list()] == ["j2", "j1"]
+    reopened = JobStore(tmp_path / "jobs.sqlite3")
+    assert [job["input_name"] for job in reopened.list()] == ["two.mp4", "one.mp4"]

@@ -140,6 +140,7 @@ def _process_job(job: dict) -> None:
                     result = run_operation(
                         incoming,
                         operation=job["operation"],
+                        masking_mode=job.get("masking_mode", "new"),
                         target_language=job["target_language"],
                         source_language=job["source_language"],
                         backend=backend,
@@ -222,6 +223,37 @@ def languages():
     return [{"code": code, "name": name} for code, name in LANGUAGES.items()]
 
 
+@app.post("/api/detect-language")
+async def detect_uploaded_language(file: UploadFile = File(...)):
+    suffix = Path(file.filename or "video.mp4").suffix.lower()
+    if suffix not in {".mp4", ".mov", ".mkv", ".avi", ".webm"}:
+        raise HTTPException(415, "Upload an MP4, MOV, MKV, AVI, or WebM video.")
+    with tempfile.TemporaryDirectory(prefix="language-detection-", dir=DATA_DIR) as temporary:
+        root = Path(temporary)
+        source = root / f"source{suffix}"
+        written = 0
+        try:
+            with source.open("wb") as output:
+                while chunk := await file.read(1024 * 1024):
+                    written += len(chunk)
+                    if written > MAX_UPLOAD_BYTES:
+                        raise HTTPException(413, "Video exceeds configured upload size limit.")
+                    output.write(chunk)
+        finally:
+            await file.close()
+        try:
+            from .vendor.service_b.src.transcriber import detect_language
+
+            detected = await asyncio.to_thread(detect_language, source, root)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(422, str(exc)) from exc
+    code = detected["code"].lower()
+    return {"code": code, "name": LANGUAGES.get(code, code.upper()),
+            "confidence": round(detected["probability"], 3)}
+
+
 @app.get("/health")
 def health():
     return {
@@ -263,11 +295,14 @@ async def submit_job(
     target_language: str = Form(...),
     source_language: str | None = Form(None),
     operation: str = Form("combine"),
+    masking_mode: str = Form("new"),
 ):
     if operation not in {"masking", "dubbing", "combine"}:
         raise HTTPException(422, "Unsupported operation.")
-    if operation in {"masking", "combine"} and not magnific_auth.status()["connected"]:
-        raise HTTPException(409, "Connect Magnific before starting Masking or Combine.")
+    if masking_mode not in {"overlay", "new"}:
+        raise HTTPException(422, "Unsupported masking mode.")
+    if operation in {"masking", "combine"} and masking_mode == "new" and not magnific_auth.status()["connected"]:
+        raise HTTPException(409, "Connect Magnific before using the New masking method.")
     target = target_language.lower().strip()
     if target not in LANGUAGES:
         raise HTTPException(422, f"Unsupported target language code: {target}")
@@ -296,22 +331,22 @@ async def submit_job(
         await file.close()
 
     source = (source_language or os.getenv("PIPELINE_SOURCE_LANGUAGE", "auto")).strip() or "auto"
-    store.create(job_id, target, source, destination, safe_name, operation)
-    return {"job_id": job_id, "status": "queued", "operation": operation, "status_url": f"/api/jobs/{job_id}"}
+    store.create(job_id, target, source, destination, safe_name, operation, masking_mode)
+    return {"job_id": job_id, "status": "queued", "operation": operation,
+            "masking_mode": masking_mode, "status_url": f"/api/jobs/{job_id}"}
 
 
-@app.get("/api/jobs/{job_id}")
-def job_status(job_id: str):
-    record = store.get(job_id)
-    if record is None:
-        raise HTTPException(404, "Job not found")
+def _job_payload(record: dict) -> dict:
+    job_id = record["job_id"]
     return {
         "job_id": job_id,
+        "input_name": record["input_name"],
         "status": record["status"],
         "stage": record["stage"],
         "target_language": record["target_language"],
         "source_language": record["source_language"],
         "operation": record["operation"],
+        "masking_mode": record.get("masking_mode", "new"),
         "error": record["error"],
         "music": _read_json(_artifacts_dir(job_id) / "music.json"),
         "artifacts": {
@@ -323,6 +358,20 @@ def job_status(job_id: str):
         "created_at": record["created_at"],
         "updated_at": record["updated_at"],
     }
+
+
+@app.get("/api/jobs")
+def list_jobs(limit: int = 100):
+    """List the durable queue and job history for browser restoration."""
+    return [_job_payload(record) for record in store.list(limit)]
+
+
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str):
+    record = store.get(job_id)
+    if record is None:
+        raise HTTPException(404, "Job not found")
+    return _job_payload(record)
 
 
 @app.get("/api/jobs/{job_id}/logs")
