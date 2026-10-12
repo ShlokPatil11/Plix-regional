@@ -211,6 +211,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Directory Language Studio", version="1.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 app.mount("/images", StaticFiles(directory=Path(__file__).parent / "static" / "images"), name="images")
+app.mount("/boot-media", StaticFiles(directory=Path(__file__).parent / "bg video"), name="boot-media")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -372,6 +373,20 @@ def job_status(job_id: str):
     if record is None:
         raise HTTPException(404, "Job not found")
     return _job_payload(record)
+
+
+@app.delete("/api/jobs/{job_id}")
+def remove_queued_job(job_id: str):
+    outcome = store.remove_queued(job_id)
+    if outcome == "unknown_job":
+        raise HTTPException(404, "Job not found")
+    if outcome == "not_queued":
+        raise HTTPException(409, "Only jobs that have not started can be removed from the queue.")
+    job_root = (JOB_ROOT / job_id).resolve()
+    if job_root.parent != JOB_ROOT.resolve():
+        raise HTTPException(400, "Invalid job ID")
+    shutil.rmtree(job_root, ignore_errors=True)
+    return {"job_id": job_id, "status": "removed"}
 
 
 @app.get("/api/jobs/{job_id}/logs")

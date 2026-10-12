@@ -166,3 +166,24 @@ def test_jobs_endpoint_lists_queue_and_history(api, tmp_path):
     assert jobs["j1"]["status"] == "queued"
     assert jobs["j2"]["status"] == "completed"
     assert jobs["j1"]["input_name"] == "in.mp4"
+
+
+def test_remove_queued_job_deletes_record_and_job_files(api, tmp_path):
+    module, client = api
+    art = new_job(module, tmp_path)
+    (art / "temporary.txt").write_text("queued", encoding="utf-8")
+
+    response = client.delete("/api/jobs/j1")
+
+    assert response.status_code == 200
+    assert module.store.get("j1") is None
+    assert not (module.JOB_ROOT / "j1").exists()
+
+
+def test_remove_rejects_a_job_that_has_started(api, tmp_path):
+    module, client = api
+    new_job(module, tmp_path)
+    module.store.claim()
+
+    assert client.delete("/api/jobs/j1").status_code == 409
+    assert module.store.get("j1") is not None

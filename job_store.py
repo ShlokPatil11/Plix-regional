@@ -193,6 +193,21 @@ class JobStore:
             jobs.append(record)
         return jobs
 
+    def remove_queued(self, job_id: str) -> str:
+        """Atomically remove a job only while it is still waiting in the queue."""
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                db.commit()
+                return "unknown_job"
+            if row["status"] != "queued":
+                db.commit()
+                return "not_queued"
+            db.execute("DELETE FROM jobs WHERE job_id=?", (job_id,))
+            db.commit()
+        return "removed"
+
     def _write_manifest(self, job_id: str) -> None:
         record = self.get(job_id)
         if record is None:

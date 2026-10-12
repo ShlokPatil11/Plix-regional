@@ -91,6 +91,17 @@ def test_masking_mode_is_persisted(tmp_path):
     assert store.claim()["masking_mode"] == "overlay"
 
 
+def test_only_queued_jobs_can_be_removed(tmp_path):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    store.create("running", "hi", "auto", tmp_path / "r.mp4", "r.mp4")
+    store.create("queued", "hi", "auto", tmp_path / "q.mp4", "q.mp4")
+    store.claim()
+
+    assert store.remove_queued("running") == "not_queued"
+    assert store.remove_queued("queued") == "removed"
+    assert store.remove_queued("queued") == "unknown_job"
+
+
 def test_list_returns_persisted_jobs_newest_first(tmp_path):
     store = JobStore(tmp_path / "jobs.sqlite3")
     store.create("j1", "hi", "auto", tmp_path / "one.mp4", "one.mp4")

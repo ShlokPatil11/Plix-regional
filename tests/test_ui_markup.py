@@ -34,3 +34,16 @@ def test_custom_music_is_offered_even_when_no_music_was_identified():
     ok_branch_end = HTML.index("panel.append(label, slider, value, apply, status);")
     assert HTML.index("panel.append(customMusicSection(") > ok_branch_end
     assert "Music not identified — voice-only video." in HTML
+
+
+def test_ui_has_dedicated_create_queue_and_history_views():
+    for needle in ('id="create-view"', 'id="queue-view"', 'id="history-view"',
+                   'data-view="queue"', 'data-view="history"', "method: 'DELETE'", 'Remove'):
+        assert needle in HTML, needle
+
+
+def test_ui_plays_boot_video_before_revealing_the_app():
+    for needle in ('id="boot-screen"', 'id="boot-video"', 'autoplay muted playsinline',
+                   '/boot-media/Green_liquid_filling_frame_1080p_20261005174418_gwr_video_mvp.mp4',
+                   "addEventListener('ended', finishBoot)", 'Skip intro'):
+        assert needle in HTML, needle
