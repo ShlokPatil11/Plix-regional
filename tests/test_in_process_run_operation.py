@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 from helpers import make_tone, make_video, mean_volume_db
@@ -90,11 +91,53 @@ def test_masking_overlay_uses_service_a_instead_of_wan_cleanup(tmp_path, monkeyp
 
     monkeypatch.setattr(in_process, "LocalSubtitleTranslatorAdapter", FakeOverlayAdapter)
     monkeypatch.setattr(in_process, "_run_clean_stage", lambda *args, **kwargs: pytest.fail("WAN cleanup ran"))
+    music_info = tmp_path / "masking-music.json"
+    music_info.write_text(json.dumps({"status": "not_identified", "mixable": False}), encoding="utf-8")
+    monkeypatch.setattr(in_process, "analyze_masking_music", lambda backend, video, job_id: {
+        "music_info": backend.upload(music_info, filename="music.json", content_type="application/json")
+    })
     artifacts = in_process.run_operation(
         source, operation="masking", masking_mode="overlay",
         target_language="hi", backend=backend, job_id="job1",
     )
-    assert {"final_video", "masking_video", "service_a_video", "translated_captions"} <= artifacts.keys()
+    assert {"final_video", "masking_video", "voice_video", "service_a_video",
+            "translated_captions", "music_info"} <= artifacts.keys()
+    assert artifacts["voice_video"].metadata["path"].endswith("voice_video.mp4")
+
+
+def test_masking_transcript_mode_generates_captions_from_audio(tmp_path, monkeypatch):
+    backend = FileArtifactBackend(tmp_path / "art")
+    source = backend.upload(make_video(tmp_path / "in.mp4"), filename="in.mp4", content_type="video/mp4")
+    captions = tmp_path / "translated.srt"
+    captions.write_text("1\n00:00:00,000 --> 00:00:01,000\nनमस्ते\n", encoding="utf-8")
+
+    def caption_stage(input_artifact, target_language, source_language, selected_backend, job_id, on_stage):
+        assert input_artifact is source
+        assert (target_language, source_language) == ("hi", "auto")
+        return {"final_video": source, "translated_captions": selected_backend.upload(
+            captions, filename="translated-captions.srt", content_type="application/x-subrip"
+        )}
+
+    monkeypatch.setattr(in_process, "_run_transcript_caption_stage", caption_stage)
+    monkeypatch.setattr(in_process, "LocalSubtitleTranslatorAdapter",
+                        lambda *args, **kwargs: pytest.fail("visual OCR ran"))
+    monkeypatch.setattr(in_process, "_run_clean_stage", lambda *args, **kwargs: pytest.fail("WAN cleanup ran"))
+    monkeypatch.setattr(in_process, "analyze_masking_music", lambda *args, **kwargs: {})
+
+    artifacts = in_process.run_operation(
+        source, operation="masking", masking_mode="transcript", target_language="hi",
+        source_language="auto", backend=backend, job_id="job1",
+    )
+
+    assert {"final_video", "masking_video", "voice_video", "translated_captions"} <= artifacts.keys()
+    assert Path(artifacts["translated_captions"].metadata["path"]).read_text(encoding="utf-8").endswith("नमस्ते\n")
+
+
+def test_auto_caption_renderer_does_not_require_ffmpeg_libass():
+    source = Path(in_process.__file__).read_text(encoding="utf-8")
+
+    assert "_render_captions(staged_source, render_cues, output, font)" in source
+    assert "force_style" not in source
 
 
 def test_combine_overlay_uses_earlier_pipeline(tmp_path, monkeypatch):

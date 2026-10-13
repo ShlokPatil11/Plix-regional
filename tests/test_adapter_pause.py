@@ -8,7 +8,7 @@ from dir_language_pipeline import service_adapters
 from dir_language_pipeline.contracts import AwaitingFaceSelection
 from dir_language_pipeline.media import FileArtifactBackend
 from dir_language_pipeline.music import MusicResult
-from dir_language_pipeline.service_adapters import TextToAudioAdapter
+from dir_language_pipeline.service_adapters import TextToAudioAdapter, analyze_masking_music
 from src import analysis, engine, faces
 from src.common import PipelineError
 from src.faces import FaceCandidate
@@ -114,3 +114,18 @@ def test_unexpected_music_error_is_a_soft_not_identified_result(env):
     published = json.loads((backend.root / "music.json").read_text(encoding="utf-8"))
     assert published["status"] == "not_identified"
     assert "yt-dlp exploded" in published["error"]
+
+
+def test_masking_music_uses_artifact_root_not_docker_data_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("PIPELINE_DATA_DIR", "/data")
+    backend = FileArtifactBackend(tmp_path / "artifacts")
+    source = backend.upload(make_video(tmp_path / "in.mp4", seconds=2.0), filename="in.mp4", content_type="video/mp4")
+    monkeypatch.setattr(
+        service_adapters, "identify_and_fetch",
+        lambda *a, **k: MusicResult("not_identified", {"status": "not_identified"}),
+    )
+
+    result = analyze_masking_music(backend, source, "job1")
+
+    assert result["music_info"].metadata["path"] == str(backend.root / "music.json")
+    assert (backend.root / ".masking-music" / "source-video.mp4").is_file()

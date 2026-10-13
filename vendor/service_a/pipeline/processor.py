@@ -247,7 +247,8 @@ def update_segment_boxes(segments, metadata, config):
             # expose source text when the original card is off-center.
             source_box = s.bbox
             pad_x = max(8, int(cur_h * 0.15))
-            pad_y = max(4, int(cur_h * 0.08))
+            # Give black cards breathing room above and below the translated text.
+            pad_y = max(10, int(cur_h * 0.16))
             source_x = source_box.x if source_box and source_box.width > 0 else int((meta_w - min(meta_w * 0.85, max(440, tw + 120))) / 2)
             source_w = source_box.width if source_box and source_box.width > 0 else min(int(meta_w * 0.85), max(440, int(tw + 120)))
             bx = max(0, source_x - pad_x)

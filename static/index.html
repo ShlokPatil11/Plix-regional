@@ -135,9 +135,10 @@
       <label>Masking method<select name="masking_mode" id="masking-mode">
         <option value="new">New — remove captions and add translated text</option>
         <option value="overlay">Overlay — cover existing text with translated text</option>
+        <option value="transcript">Auto captions — transcribe audio, translate, and add captions</option>
       </select></label>
     </div>
-    <p class="workflow-note">Choose New for Wan 3.0 caption removal and replacement, or Overlay to cover the existing captions. This choice applies to Masking and Combine.</p>
+    <p class="workflow-note">Choose New for Wan 3.0 caption removal and replacement, Overlay to cover existing captions, or Auto captions when the video has no existing text and captions should be generated from speech. This choice applies to Masking and Combine.</p>
     <div class="provider-status" id="magnific-status">Checking Magnific connection…</div>
     <div class="actions">
       <button type="submit" name="operation" value="masking" class="secondary">Add Masking</button>
@@ -300,13 +301,13 @@ function errorText(body, fallback) {
 }
 
 function renderMusicPanel(jobId, job, video) {
-  if (!job.music) return;
+  const initialMusic = job.music || {status: 'not_analyzed', percent: 25};
   const panel = document.createElement('div'); panel.className = 'music-panel';
   result.append(panel);
   const draw = music => {
     panel.replaceChildren();
     let slider = null;
-    if (music.status === 'ok') {
+    if (music.status === 'ok' && music.mixable !== false) {
       const label = document.createElement('p'); label.textContent = `Music: ${music.artist} – ${music.title}`;
       slider = document.createElement('input'); slider.type = 'range'; slider.min = 0; slider.max = 100;
       slider.value = music.percent ?? 25;
@@ -327,14 +328,18 @@ function renderMusicPanel(jobId, job, video) {
       panel.append(label, slider, value, apply, status);
     } else {
       const note = document.createElement('p');
-      note.textContent = music.status === 'download_failed'
+      note.textContent = music.status === 'ok'
+        ? `Music detected: ${music.artist} – ${music.title}. The original masking audio already contains this track.`
+        : music.status === 'download_failed'
         ? `Music identified (${music.artist} – ${music.title}) but could not be downloaded — voice-only video.`
-        : 'Music not identified — voice-only video.';
+        : music.status === 'not_analyzed'
+          ? 'Automatic music detection was not run for this masking job. You can add custom music below.'
+          : 'Music not identified — voice-only video.';
       panel.append(note);
     }
     panel.append(customMusicSection(jobId, music, video, () => slider ? Number(slider.value) : (music.percent ?? 25), draw));
   };
-  draw(job.music);
+  draw(initialMusic);
 }
 
 function customMusicSection(jobId, music, video, currentPercent, redraw) {

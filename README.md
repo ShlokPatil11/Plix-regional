@@ -20,8 +20,12 @@ The two subtitle files describe different content. Service B never receives Serv
 From this directory, install `requirements.txt`, install FFmpeg and Tesseract, configure the environment variables below, then run:
 
 ```sh
-uvicorn dir_language_pipeline.api:app --host 0.0.0.0 --port 8000
+.venv/bin/python -m uvicorn local_server:app --host 0.0.0.0 --port 8000
 ```
+
+Use the local entry point above from this checkout. The Docker image uses
+`dir_language_pipeline.api:app` because the Dockerfile installs the source under
+that package name.
 
 Open `http://localhost:8000`. Choose **Masking** to run Service A alone, **Dubbing** to run Service B alone on the uploaded video, or **Combine** to run Service A followed by Service B and mux their outputs. Each action accepts the selected target language and optional spoken source language. `POST /api/jobs` accepts the same fields plus `operation` (`masking`, `dubbing`, or `combine`; defaults to `combine`). It returns a job ID; Dubbing and Combine pause at `awaiting_face_selection` after analysis until the face is confirmed (in the UI, or via `POST /api/jobs/{job_id}/face`), then continue; a job in which no usable face is found skips the pause. Masking is unchanged and does not pause. Poll `GET /api/jobs/{job_id}` and download the artifacts returned when processing completes.
 
@@ -42,7 +46,8 @@ docker run --env-file .env -p 8000:8000 -v directory-language-data:/data directo
 
 Configure the required secrets in `.env`:
 
-- `GEMINI_API_KEY` for Service A visual translation (default model: `gemini-3.6-flash`). Create the key in Google AI Studio and set it as a deployment secret. Set `TRANSLATION_PROVIDER=claude` plus `ANTHROPIC_API_KEY` and `TRANSLATION_MODEL` only if you want Claude instead.
+- `OPENAI_API_KEY` for Service A visual-text detection with GPT vision. The default is `gpt-6-luna`. Fast footage is analyzed at 2x temporal density without changing output speed; tune `OPENAI_VISION_ANALYSIS_SLOWDOWN`, `OPENAI_VISION_SAMPLE_SECONDS`, `OPENAI_VISION_MASK_PREROLL_SECONDS`, and `OPENAI_VISION_MASK_POSTROLL_SECONDS` if needed.
+- `GEMINI_API_KEY` for Service A translation (default model: `gemini-3.6-flash`). Create the key in Google AI Studio and set it as a deployment secret. Set `TRANSLATION_PROVIDER=claude` plus `ANTHROPIC_API_KEY` and `TRANSLATION_MODEL` only if you want Claude instead.
 - `ELEVENLABS_API_KEY` for Service B.
 - `SYNC_API_KEY` when using its Sync Labs lip-sync stage.
 - `HF_TOKEN` is optional for the configured Hugging Face lip-sync path.

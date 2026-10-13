@@ -300,7 +300,7 @@ async def submit_job(
 ):
     if operation not in {"masking", "dubbing", "combine"}:
         raise HTTPException(422, "Unsupported operation.")
-    if masking_mode not in {"overlay", "new"}:
+    if masking_mode not in {"overlay", "new", "transcript"}:
         raise HTTPException(422, "Unsupported masking mode.")
     if operation in {"masking", "combine"} and masking_mode == "new" and not magnific_auth.status()["connected"]:
         raise HTTPException(409, "Connect Magnific before using the New masking method.")
@@ -481,9 +481,11 @@ def remix(job_id: str, body: RemixRequest):
     art = _artifacts_dir(job_id)
     info = _read_json(art / "music.json")
     voice, track = art / "voice_video.mp4", art / "music_track.mp3"
+    final_path = record["artifacts"].get("final_video")
+    if not voice.is_file() and record.get("operation") == "masking" and final_path:
+        shutil.copyfile(Path(final_path), voice)
     if not info or info.get("status") != "ok" or not voice.is_file() or not track.is_file():
         raise HTTPException(409, "No identified music track for this job")
-    final_path = record["artifacts"].get("final_video")
     if not final_path:
         raise HTTPException(409, "The job has no final video to rebuild")
     subtitles = art / "visual_subtitles.srt"
@@ -518,6 +520,8 @@ def set_custom_music(
     art = _artifacts_dir(job_id)
     voice = art / "voice_video.mp4"
     final_path = record["artifacts"].get("final_video")
+    if not voice.is_file() and record.get("operation") == "masking" and final_path:
+        shutil.copyfile(Path(final_path), voice)
     if not voice.is_file() or not final_path:
         raise HTTPException(409, "This job has no voice-only video to add music to")
     duration = media_duration(voice)

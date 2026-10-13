@@ -20,8 +20,8 @@ def api(tmp_path, monkeypatch):
 SRT = "1\n00:00:00,000 --> 00:00:01,000\nhello\n"
 
 
-def completed_job(module, tmp_path, music="ok", subtitles=False, voice=True):
-    module.store.create("j1", "hi", "auto", tmp_path / "in.mp4", "in.mp4", "combine")
+def completed_job(module, tmp_path, music="ok", subtitles=False, voice=True, operation="combine"):
+    module.store.create("j1", "hi", "auto", tmp_path / "in.mp4", "in.mp4", operation)
     art = module.JOB_ROOT / "j1" / "artifacts"
     art.mkdir(parents=True, exist_ok=True)
     artifacts = {}
@@ -100,6 +100,18 @@ def test_custom_music_works_when_nothing_was_detected_and_remix_then_works(api, 
     assert module.store.get("j1")["artifacts"]["music_track"] == str(art / "music_track.mp3")
     again = client.post("/api/jobs/j1/remix", json={"music_percent": 10})
     assert again.status_code == 200 and again.json()["music_percent"] == 10
+
+
+def test_existing_masking_job_uses_final_video_when_voice_artifact_is_missing(api, tmp_path):
+    module, client = api
+    art = completed_job(module, tmp_path, music="none", operation="masking")
+    (art / "voice_video.mp4").unlink()
+    name, data = song(tmp_path)
+
+    response = post_file(client, name, data, percent=35)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["music_percent"] == 35
 
 
 def test_default_percent_keeps_the_previous_slider_value_or_25(api, tmp_path):

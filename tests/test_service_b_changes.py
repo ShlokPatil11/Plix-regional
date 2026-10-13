@@ -28,6 +28,78 @@ def test_magnific_media_url_supports_nested_creation_shapes():
     assert clean_translate._creation_media_url({"creation": {"status": "completed"}}) is None
 
 
+def test_magnific_visual_cues_come_from_video_overlays_not_audio(tmp_path, monkeypatch):
+    class Box:
+        x, y, width, height = 10, 20, 300, 80
+        patch_color = "0x121212"
+
+    class Detector:
+        def __init__(self, config):
+            pass
+
+        def detect_subtitles(self, source, metadata):
+            return [type("Segment", (), {
+                "start": 1.0, "end": 2.0, "source_text": "ದಿನ 14", "bbox": Box(),
+            })()]
+
+    real_import = clean_translate.importlib.import_module
+    monkeypatch.setattr(clean_translate.importlib, "import_module", lambda name: (
+        type("DetectorModule", (), {"OpenAICardDetector": Detector})
+        if name == "pipeline.openai_card_detector" else real_import(name)
+    ))
+
+    class Capture:
+        def get(self, key):
+            return 1080 if key == clean_translate.cv2.CAP_PROP_FRAME_WIDTH else 1920
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(clean_translate.cv2, "VideoCapture", lambda path: Capture())
+    cues = clean_translate._detect_visual_cues_with_openai(tmp_path / "video.mp4", 3.0)
+
+    assert cues == [{"start": 1.0, "end": 2.0, "text": "ದಿನ 14",
+                     "bbox": {"x": 10, "y": 20, "width": 300, "height": 80,
+                              "frame_width": 1080, "frame_height": 1920,
+                              "patch_color": "0x121212"}}]
+
+
+def test_detected_mask_box_scales_and_clamps_to_the_render_frame():
+    bbox = {"x": -10, "y": 20, "width": 310, "height": 80,
+            "frame_width": 1080, "frame_height": 1920}
+
+    assert clean_translate._scaled_mask_box(bbox, 540, 960) == (0, 10, 150, 50)
+    assert clean_translate._patch_color("0x121212") == "#121212"
+
+
+def test_visual_translation_prompt_uses_before_after_sequence_context(monkeypatch):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": json.dumps({"translations": [
+                {"index": 0, "text": "Before"}, {"index": 1, "text": "After"},
+            ]})}}]}
+
+    def post(url, **kwargs):
+        captured.update(kwargs["json"])
+        return Response()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(clean_translate.requests, "post", post)
+    cues = [{"start": 0, "end": 1, "text": "ಮೊದಲು"},
+            {"start": 1, "end": 2, "text": "ನಂತರ"}]
+
+    translated = clean_translate._translate_cues_with_openai(cues, "en")
+
+    prompt = captured["messages"][0]["content"]
+    assert "Before" in prompt and "After" in prompt and "ordered cue list" in prompt
+    assert [cue["text"] for cue in translated] == ["Before", "After"]
+
+
 def test_dubbing_request_drops_background_audio(tmp_path, monkeypatch):
     sent = {}
 

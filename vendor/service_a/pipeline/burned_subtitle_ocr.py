@@ -372,13 +372,13 @@ def extract_burned(video, metadata, config, provider=None):
     # Agent runs first when requested — it produces accurate per-segment bboxes
     if target_box == 'agent':
         try:
-            from pipeline.agent_card_detector import AgentCardDetector
-            detector = AgentCardDetector(config)
+            from pipeline.openai_card_detector import OpenAICardDetector
+            detector = OpenAICardDetector(config)
             agent_segs = detector.detect_subtitles(video, metadata)
             if agent_segs:
                 return agent_segs
         except Exception as exc:
-            logging.getLogger(__name__).warning('AgentCardDetector failed, falling back to Gemini OCR: %s', exc)
+            raise RuntimeError(f'GPT vision overlay detection failed: {exc}') from exc
     # Burned-subtitle masking is intentionally Gemini-only. A local OCR fallback can
     # return plausible text with an incorrect bounding box, which produces a bad mask.
     # Fail the job instead so an inaccurate Tesseract result is never rendered.

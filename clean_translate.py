@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import importlib
 import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from xml.sax.saxutils import escape
 
 import cv2
@@ -73,40 +76,33 @@ def _srt_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
 
 
-def _transcribe_with_openai(source: Path) -> list[dict]:
-    from dotenv import load_dotenv
-
-    load_dotenv(Path(__file__).resolve().parent / ".env")
-    key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    if not key:
-        raise RuntimeError("OPENAI_API_KEY is required for transcription")
-    audio = source.with_name(f"{source.stem}-transcription.mp3")
-    _run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-          "-i", str(source), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", str(audio)])
-    try:
-        with audio.open("rb") as stream:
-            response = requests.post(
-                "https://api.openai.com/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {key}"},
-                files={"file": (audio.name, stream, "audio/mpeg")},
-                data={
-                    "model": os.getenv("OPENAI_TIMED_TRANSCRIPTION_MODEL", "whisper-1"),
-                    "response_format": "verbose_json",
-                    "timestamp_granularities[]": "segment",
-                    "prompt": "Preserve Hindi, English, and Hinglish. Important names include Plix and ACV.",
-                },
-                timeout=600,
-            )
-        response.raise_for_status()
-        segments = response.json().get("segments") or []
-        cues = [{"start": float(item["start"]), "end": float(item["end"]),
-                 "text": str(item.get("text") or "").strip()}
-                for item in segments if str(item.get("text") or "").strip()]
-        if not cues:
-            raise RuntimeError("OpenAI returned no timed transcript segments")
-        return cues
-    finally:
-        audio.unlink(missing_ok=True)
+def _detect_visual_cues_with_openai(source: Path, duration: float) -> list[dict]:
+    """Read burned overlay text from video pixels; never infer it from audio."""
+    service_root = Path(__file__).resolve().parent / "vendor" / "service_a"
+    root_string = str(service_root)
+    if root_string not in sys.path:
+        sys.path.insert(0, root_string)
+    detector_module = importlib.import_module("pipeline.openai_card_detector")
+    detector = detector_module.OpenAICardDetector(SimpleNamespace(ffmpeg="ffmpeg"))
+    segments = detector.detect_subtitles(source, SimpleNamespace(duration=duration))
+    capture = cv2.VideoCapture(str(source))
+    frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    capture.release()
+    cues = []
+    for segment in segments:
+        cue = {"start": float(segment.start), "end": float(segment.end),
+               "text": str(segment.source_text).strip()}
+        if segment.bbox:
+            cue["bbox"] = {"x": segment.bbox.x, "y": segment.bbox.y,
+                           "width": segment.bbox.width, "height": segment.bbox.height,
+                           "frame_width": frame_width, "frame_height": frame_height,
+                           "patch_color": segment.bbox.patch_color or "0x000000"}
+        if cue["text"]:
+            cues.append(cue)
+    if not cues:
+        raise RuntimeError("GPT vision found no visible overlay text to translate")
+    return cues
 
 
 def _translate_cues_with_openai(cues: list[dict], target_language: str) -> list[dict]:
@@ -131,7 +127,11 @@ def _translate_cues_with_openai(cues: list[dict], target_language: str) -> list[
             "messages": [
                 {"role": "system", "content": (
                     f"Translate each subtitle into simple, natural {target}. Keep the meaning, product claims, "
-                    "and brand names Plix and ACV. Do not add explanations. Preserve every index.")},
+                    "and brand names Plix and ACV. Read the complete ordered cue list as one visual-ad sequence "
+                    "before translating individual cards. Use scene and neighboring-card context, not isolated literal "
+                    "word meanings. In transformations or comparisons, translate paired temporal labels as the natural "
+                    "'Before' and 'After' equivalents in the target language—not 'First', 'Earlier', 'Later', or 'Now'—"
+                    "unless the surrounding sequence clearly has another meaning. Do not add explanations. Preserve every index.")},
                 {"role": "user", "content": json.dumps(indexed, ensure_ascii=False)},
             ],
             "response_format": {"type": "json_schema", "json_schema": schema},
@@ -144,8 +144,7 @@ def _translate_cues_with_openai(cues: list[dict], target_language: str) -> list[
     by_index = {int(item["index"]): str(item["text"]).strip() for item in translated}
     if len(by_index) != len(cues):
         raise RuntimeError("OpenAI translation omitted one or more subtitle cues")
-    return [{"start": cue["start"], "end": cue["end"], "text": by_index[index]}
-            for index, cue in enumerate(cues)]
+    return [{**cue, "text": by_index[index]} for index, cue in enumerate(cues)]
 
 
 def _font_family(font_path: Path) -> str:
@@ -183,11 +182,16 @@ def _pango_overlays(cues: list[dict], width: int, font_path: Path, root: Path) -
     overlays = []
     for index, cue in enumerate(cues):
         path = root / f"caption-{index:04d}.png"
+        bbox = cue.get("bbox") or {}
+        source_width = max(1, int(bbox.get("frame_width") or width))
+        detected_width = int(bbox.get("width") or round(width * 0.86))
+        label_width = min(round(width * 0.86), max(160, round(detected_width * width / source_width * 1.15)))
         command = [
             pango, "--no-display", "--backend=cairo", "--pixels",
             "--background=#000000ff", "--foreground=#ffffffff",
-            "--align=center", "--wrap=word-char", f"--width={round(width * 0.86)}",
-            "--margin=0", "--spacing=4", "--font", f"{family} SemiBold 38",
+            "--align=center", "--wrap=word-char", f"--width={label_width}",
+            "--margin", os.getenv("CAPTION_CARD_PADDING_PX", "10"),
+            "--spacing=4", "--font", f"{family} SemiBold 38",
             "--text", str(cue["text"]), "--output", str(path),
         ]
         completed = subprocess.run(command, env=env, capture_output=True, text=True)
@@ -195,6 +199,25 @@ def _pango_overlays(cues: list[dict], width: int, font_path: Path, root: Path) -
             raise RuntimeError(completed.stderr.strip() or "Pango could not render a caption")
         overlays.append(Image.open(path).convert("RGBA"))
     return overlays
+
+
+def _scaled_mask_box(bbox: dict, width: int, height: int) -> tuple[int, int, int, int]:
+    """Scale a detected source-card rectangle to the render frame and clamp it."""
+    source_width = max(1, int(bbox.get("frame_width") or width))
+    source_height = max(1, int(bbox.get("frame_height") or height))
+    x1 = round(float(bbox.get("x", 0)) * width / source_width)
+    y1 = round(float(bbox.get("y", 0)) * height / source_height)
+    x2 = round((float(bbox.get("x", 0)) + float(bbox.get("width", 0))) * width / source_width)
+    y2 = round((float(bbox.get("y", 0)) + float(bbox.get("height", 0))) * height / source_height)
+    return (max(0, min(width, x1)), max(0, min(height, y1)),
+            max(0, min(width, x2)), max(0, min(height, y2)))
+
+
+def _patch_color(value: str) -> str:
+    raw = str(value or "0x000000").strip()
+    if raw.lower().startswith("0x"):
+        raw = "#" + raw[2:]
+    return raw if raw.startswith("#") and len(raw) in (4, 7, 9) else "#000000"
 
 
 def _render_captions(video: Path, cues: list[dict], output: Path, font_path: Path) -> None:
@@ -212,14 +235,32 @@ def _render_captions(video: Path, cues: list[dict], output: Path, font_path: Pat
             if not ok:
                 break
             now = frame_number / fps
-            cue_index = next((index for index, cue in enumerate(cues)
-                              if float(cue["start"]) <= now < float(cue["end"])), None)
-            if cue_index is not None:
+            active = [index for index, cue in enumerate(cues)
+                      if float(cue["start"]) <= now < float(cue["end"])]
+            if active:
                 image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGBA")
-                label = overlays[cue_index]
-                x = max(0, (width - label.width) // 2)
-                y = max(0, height - safe_bottom - label.height)
-                image.alpha_composite(label, (x, y))
+                for cue_index in active:
+                    cue = cues[cue_index]
+                    label = overlays[cue_index]
+                    bbox = cue.get("bbox")
+                    if bbox and bbox.get("frame_width") and bbox.get("frame_height"):
+                        # Cover the complete detected source card first. Do not
+                        # depend on the translated label's dimensions to hide it.
+                        from PIL import ImageDraw
+                        mask_box = _scaled_mask_box(bbox, width, height)
+                        if mask_box[2] > mask_box[0] and mask_box[3] > mask_box[1]:
+                            ImageDraw.Draw(image).rectangle(
+                                mask_box, fill=_patch_color(bbox.get("patch_color")))
+                        center_x = (mask_box[0] + mask_box[2]) / 2
+                        center_y = (mask_box[1] + mask_box[3]) / 2
+                        x = round(center_x - label.width / 2)
+                        y = round(center_y - label.height / 2)
+                    else:
+                        x = (width - label.width) // 2
+                        y = height - safe_bottom - label.height
+                    x = max(0, min(width - label.width, x))
+                    y = max(0, min(height - label.height, y))
+                    image.alpha_composite(label, (x, y))
                 frame = cv2.cvtColor(__import__("numpy").array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
             writer.write(frame)
             frame_number += 1
@@ -233,8 +274,8 @@ def run_clean_translate(source: Path, target_language: str, work: Path, auth: Ma
     work.mkdir(parents=True, exist_ok=True)
     duration = _probe_duration(source)
     slots = _slots(duration)
-    if on_stage: on_stage("transcribing_with_openai")
-    source_cues = _transcribe_with_openai(source)
+    if on_stage: on_stage("detecting_visual_text_with_openai")
+    source_cues = _detect_visual_cues_with_openai(source, duration)
     if on_stage: on_stage("translating_with_openai")
     cues = _translate_cues_with_openai(source_cues, target_language)
     subtitle_path = work / "translated-captions.srt"

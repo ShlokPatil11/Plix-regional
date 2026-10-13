@@ -13,7 +13,7 @@ from typing import Any
 
 from .contracts import Artifact, AwaitingFaceSelection
 from .media import ArtifactBackend
-from .music import MusicResult, ShazamIdentifier, YouTubeFetcher, identify_and_fetch
+from .music import MusicResult, ShazamIdentifier, YouTubeFetcher, identify_and_fetch, media_duration
 
 
 SERVICE_A_ROOT = Path(__file__).resolve().parent / "vendor" / "service_a"
@@ -97,6 +97,9 @@ class LocalSubtitleTranslatorAdapter:
             database_module = importlib.import_module("database.db")
             processor_module = importlib.import_module("pipeline.processor")
             input_path = self.backend.download(video, root / video.filename)
+            pipeline_data_dir = os.getenv(
+                "PIPELINE_DATA_DIR", str(Path(tempfile.gettempdir()) / "dir-language-pipeline")
+            )
             env = {
                 "INPUT_DIR": str(root / "incoming"),
                 "PROCESSING_DIR": str(root / "processing"),
@@ -109,8 +112,11 @@ class LocalSubtitleTranslatorAdapter:
                 "DB_PATH": str(root / "jobs.db"),
                 "FILE_STABILITY_SECONDS": "0.01",
                 "SOURCE_LANGUAGE": source_language,
-                "OCR_PROVIDER": os.getenv("OCR_PROVIDER", "gemini"),
+                "OCR_PROVIDER": "openai",
                 "OCR_TARGET_BOX": os.getenv("OCR_TARGET_BOX", "agent"),
+                # Service A loads the project .env with override=True. Preserve the
+                # host's real data root so a local run is not redirected to /data.
+                "PIPELINE_DATA_DIR": pipeline_data_dir,
             }
             previous = {key: os.environ.get(key) for key in env}
             os.environ.update(env)
@@ -304,3 +310,24 @@ class TextToAudioAdapter:
             )
         result.update(extras)
         return result
+
+
+def analyze_masking_music(backend: ArtifactBackend, video: Artifact, job_id: str) -> dict[str, Artifact]:
+    """Identify music for masking-only jobs without running dubbing or face analysis."""
+    backend_root = Path(getattr(backend, "root", tempfile.gettempdir())).resolve()
+    root = backend_root / ".masking-music"
+    root.mkdir(parents=True, exist_ok=True)
+    source = backend.download(video, root / "source-video.mp4")
+    try:
+        music = identify_and_fetch(
+            source, [], media_duration(source), root / "music",
+            ShazamIdentifier(), YouTubeFetcher(), ffmpeg_binary="ffmpeg",
+        )
+    except Exception as exc:
+        print(f"[Music] Masking-only analysis failed: {exc}")
+        music = MusicResult("not_identified", {"status": "not_identified", "error": str(exc)})
+    # The masking output retains its original complete audio. A detected track is
+    # informational here; remixing it would duplicate music already in that audio.
+    music.info["mixable"] = False
+    adapter = TextToAudioAdapter(backend)
+    return adapter._publish_music(music, root / "music", job_id)

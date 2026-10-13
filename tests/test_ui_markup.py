@@ -36,6 +36,23 @@ def test_custom_music_is_offered_even_when_no_music_was_identified():
     assert "Music not identified — voice-only video." in HTML
 
 
+def test_custom_music_is_offered_when_detection_was_not_run():
+    assert "job.music || {status: 'not_analyzed', percent: 25}" in HTML
+    assert "Automatic music detection was not run for this masking job." in HTML
+
+
+def test_detected_masking_music_is_not_mixed_twice():
+    assert "music.mixable !== false" in HTML
+    assert "The original masking audio already contains this track." in HTML
+
+
+def test_detector_requests_simultaneous_lower_third_overlays():
+    detector = (Path(__file__).resolve().parents[1] / "vendor/service_a/pipeline/openai_card_detector.py").read_text(encoding="utf-8")
+    assert 'self.model = os.getenv("OPENAI_VISION_MODEL", "gpt-6-luna")' in detector
+    assert "When top and bottom overlays coexist, return BOTH" in detector
+    assert "Never omit a long lower-third caption" in detector
+
+
 def test_ui_has_dedicated_create_queue_and_history_views():
     for needle in ('id="create-view"', 'id="queue-view"', 'id="history-view"',
                    'data-view="queue"', 'data-view="history"', "method: 'DELETE'", 'Remove'):
@@ -46,4 +63,9 @@ def test_ui_plays_boot_video_before_revealing_the_app():
     for needle in ('id="boot-screen"', 'id="boot-video"', 'autoplay muted playsinline',
                    '/boot-media/Green_liquid_filling_frame_1080p_20261005174418_gwr_video_mvp.mp4',
                    "addEventListener('ended', finishBoot)", 'Skip intro'):
+        assert needle in HTML, needle
+
+
+def test_ui_offers_audio_transcription_caption_mode():
+    for needle in ('value="transcript"', "Auto captions", "transcribe audio, translate"):
         assert needle in HTML, needle
